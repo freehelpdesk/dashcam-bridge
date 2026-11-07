@@ -1,6 +1,6 @@
 # dashcam-bridge
 
-A Raspberry Pi that plugs into the USB port a Tesla uses for dashcam storage. The car writes its original camera files to the Pi, the same way it writes to a USB stick. The Pi serves those files, unchanged, as a read-only SMB share.
+A Raspberry Pi that plugs into the USB port a Tesla uses for dashcam storage. The car writes its original camera files to the Pi, the same way it writes to a USB stick. The Pi serves those files over SMB. With `SHARE=live`, the share can also write the same disk.
 
 Nothing is transcoded. The share is the full-size copy that lives on the USB drive, which is a different thing from the smaller preview in the phone app.
 
@@ -59,7 +59,7 @@ User `dashcam`, password `SMB_PASSWORD` from the env file. The folders under `Te
 | `docs/build.md` | OS image, boot config, packages, provision |
 | `docs/operations.md` | Connecting, copying, troubleshooting |
 | `config/dashcam-bridge.env` | Passwords, image size, Wi-Fi |
-| `config/smb.conf` | The read-only share |
+| `config/smb.conf` | The SMB share |
 | `config/boot/config.txt.fragment` | USB device-mode overlay |
 | `scripts/provision.sh` | Applies the config on the Pi |
 | `systemd/` | Boot services |

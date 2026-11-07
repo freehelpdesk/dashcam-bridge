@@ -214,6 +214,40 @@ origin_exists() {
   dmsetup info dashcam-origin >/dev/null 2>&1
 }
 
+# Drop the share mount and the device-mapper devices. The live share maps a
+# partition of dashcam-origin, and that map has to go before the origin can.
+release_dashcam_devices() {
+  local dev
+  if findmnt -n --mountpoint "$MNT" >/dev/null 2>&1; then
+    sync || true
+    umount "$MNT" || return 1
+  fi
+  kpartx -d /dev/mapper/dashcam-origin >/dev/null 2>&1 || true
+  kpartx -d /dev/mapper/dashcam-snap >/dev/null 2>&1 || true
+  dmsetup remove dashcam-snap >/dev/null 2>&1 || true
+  if dmsetup info dashcam-origin >/dev/null 2>&1; then
+    dmsetup resume dashcam-origin >/dev/null 2>&1 || true
+    dmsetup remove dashcam-origin >/dev/null 2>&1 || dmsetup remove -f dashcam-origin >/dev/null 2>&1 || return 1
+  fi
+  if [[ -f $STATE_DIR/loops ]]; then
+    # shellcheck disable=SC1091
+    source "$STATE_DIR/loops"
+    [[ ${ORIGIN_LOOP:-} == /dev/loop* ]] && losetup -d "$ORIGIN_LOOP" >/dev/null 2>&1 || true
+    [[ ${COW_LOOP:-} == /dev/loop* ]] && losetup -d "$COW_LOOP" >/dev/null 2>&1 || true
+    rm -f "$STATE_DIR/loops"
+  fi
+  for dev in "$IMAGE" "$COW"; do
+    [[ -f $dev ]] || continue
+    losetup -j "$dev" 2>/dev/null | awk -F: '{print $1}' | while read -r loop; do
+      [[ -n $loop ]] && losetup -d "$loop"
+    done || true
+  done
+  if origin_exists; then
+    return 1
+  fi
+  return 0
+}
+
 write_loops() {
   printf 'ORIGIN_LOOP=%s\nCOW_LOOP=%s\n' "$ORIGIN_LOOP" "$COW_LOOP" >"$STATE_DIR/loops"
 }
@@ -251,10 +285,25 @@ cow_percent() {
   echo $((alloc * 100 / total))
 }
 
+share_is_ro() {
+  findmnt -n -o OPTIONS --mountpoint "$MNT" 2>/dev/null | grep -Eq '(^|,)ro(,|$)'
+}
+
 mount_share() {
-  local name dev fstype base
+  local name dev fstype base src
   mkdir -p "$MNT"
   if findmnt -n --mountpoint "$MNT" >/dev/null; then
+    if [[ $SHARE == live ]] && share_is_ro; then
+      src=$(findmnt -n -o SOURCE --mountpoint "$MNT")
+      blockdev --setrw "$src" 2>/dev/null || true
+      fstype=$(findmnt -n -o FSTYPE --mountpoint "$MNT")
+      if [[ $fstype == ext4 ]]; then
+        mount -o remount,rw,errors=continue "$MNT" || die "could not remount $MNT read-write"
+      else
+        mount -o remount,rw "$MNT" || die "could not remount $MNT read-write"
+      fi
+      log "share remounted read-write"
+    fi
     return 0
   fi
   if [[ $SHARE == live ]]; then
@@ -276,13 +325,14 @@ mount_share() {
     sleep 0.1
   done
   [[ -b $dev ]] || die "snapshot device $dev did not appear"
+  blockdev --setrw "$dev" 2>/dev/null || true
   fstype=$(blkid -o value -s TYPE "$dev" || true)
   case "$fstype" in
     ext4)
       if [[ $SHARE == live ]]; then
-        # noload does not replay the journal, so this mount does not write
-        # the disk the USB host is also using.
-        mount -t ext4 -o ro,noload,noatime "$dev" "$MNT"
+        # errors=continue keeps ext4 from flipping the share back to read-only
+        # when the USB host has also touched the filesystem.
+        mount -t ext4 -o rw,noatime,errors=continue "$dev" "$MNT"
       else
         if ! mount -t ext4 -o noatime "$dev" "$MNT"; then
           e2fsck -p "$dev" || true
@@ -292,26 +342,40 @@ mount_share() {
       fi
       ;;
     exfat)
-      mount -t exfat -o ro,noatime,umask=022 "$dev" "$MNT"
+      if [[ $SHARE == live ]]; then
+        mount -t exfat -o rw,noatime,umask=022 "$dev" "$MNT"
+      else
+        mount -t exfat -o ro,noatime,umask=022 "$dev" "$MNT"
+      fi
       ;;
     vfat)
-      mount -t vfat -o ro,noatime,umask=022 "$dev" "$MNT"
+      if [[ $SHARE == live ]]; then
+        mount -t vfat -o rw,noatime,umask=022 "$dev" "$MNT"
+      else
+        mount -t vfat -o ro,noatime,umask=022 "$dev" "$MNT"
+      fi
       ;;
     *)
       die "unrecognized filesystem '${fstype:-unknown}' on $dev"
       ;;
   esac
-  log "share mounted ($fstype)"
+  if [[ $SHARE == live ]] && share_is_ro; then
+    die "share stayed read-only ($(findmnt -n -o OPTIONS --mountpoint "$MNT" 2>/dev/null || echo unknown))"
+  fi
+  # 1 MiB of readahead per stream. Several clips then stay sequential.
+  src=$(findmnt -n -o SOURCE --mountpoint "$MNT" 2>/dev/null || true)
+  [[ -n $src ]] && blockdev --setra 2048 "$src" 2>/dev/null || true
+  blockdev --setra 2048 /dev/mapper/dashcam-origin 2>/dev/null || true
+  log "share mounted ($fstype, $(findmnt -n -o OPTIONS --mountpoint "$MNT" 2>/dev/null || echo unknown))"
 }
 
 live_refresh() {
-  local dev
-  dev=$(findmnt -n -o SOURCE --mountpoint "$MNT" 2>/dev/null || true)
-  blockdev --flushbufs /dev/mapper/dashcam-origin 2>/dev/null || true
-  [[ -n $dev ]] && blockdev --flushbufs "$dev" 2>/dev/null || true
-  sync || true
-  # USB writes land on the block device, not in this mount's cache.
-  echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
+  # A connected player is reading clips. Dropping the page cache forces every
+  # one of those reads back to the disk.
+  if smb_busy; then
+    return 0
+  fi
+  echo 2 >/proc/sys/vm/drop_caches 2>/dev/null || true
 }
 
 refresh_snapshot() {

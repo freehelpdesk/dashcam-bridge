@@ -32,11 +32,11 @@ The SMB user is `dashcam` unless you changed `SMB_USER`. The password is `SMB_PA
 
 Copy `SavedClips` and `SentryClips` when you want to keep something. `RecentClips` is the last stretch of driving and will age out.
 
-The share is read-only. Deleting a file in Finder does not change the drive the car sees.
+`SHARE=live` is the default, and that share is writable. A file you put there is on the drive the car sees. Eject the USB disk on any computer that had it open before you write, and do not write while the car has that disk open. A file copied onto the USB disk shows up after you disconnect from the share, within a couple of seconds. While a copy or playback is running, the Pi keeps the files cached so several clips can load together. Play them from the house Wi-Fi or Ethernet. The Pi's own access point is one radio and is the slow path for more than one clip.
 
-`SHARE=live` is the default. Eject the USB disk on the computer that wrote the file, then look at the share again. The file is there within a couple of seconds. If Finder is already inside the folder, leave it and open it again. A copy taken while the car is still writing can change underneath you. Set `SHARE=snapshot` for a frozen view that updates about once a minute, and only while nobody is connected.
+`SHARE=snapshot` stays read-only. It is a frozen view that updates about once a minute, and only while nobody is connected.
 
-A Mac may still complain that it cannot write `.DS_Store`. The copy of the video files works. The share is read-only on purpose.
+Finder may still complain about `.DS_Store`. Those files are blocked. Other files, including the `._` sidecar a Mac writes next to a clip on exFAT, go through.
 
 Windows uses `\\dashcam.local\dashcam`. The Files app on an iPhone can open the same SMB URL.
 

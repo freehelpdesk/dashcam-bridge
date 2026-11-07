@@ -96,9 +96,9 @@ After reboot the first start of `dashcam-storage.service` creates the drive the 
 | `dashcam-refresh.timer` | Every two seconds, drops the cache so `SHARE=live` shows new USB writes. `SHARE=snapshot` still replaces its frozen view about once a minute |
 | `dashcam-wifi.timer` | Every two minutes, joins the best saved network that is actually on. Otherwise starts the access point, trying 5 GHz and falling back to 2.4 GHz |
 
-The car writes the disk through the gadget. With `SHARE=live`, Samba reads that same disk. With `SHARE=snapshot`, Samba reads a frozen view so a long copy is not cut while the car keeps writing.
+The car writes the disk through the gadget. With `SHARE=live`, Samba uses that same disk and can write it. Do not write from SMB while the car has the disk open. With `SHARE=snapshot`, Samba reads a frozen read-only view so a long copy is not cut while the car keeps writing.
 
-The share definition is `config/smb.conf`. It is read-only, requires the SMB user, and refuses the connection if `/mnt/dashcam` is not mounted. Finder's `.DS_Store` writes are vetoed.
+The share definition is `config/smb.conf`. It requires the SMB user and refuses the connection if `/mnt/dashcam` is not mounted. Finder's `.DS_Store` writes are vetoed.
 
 Wi-Fi power save is turned off. With it left on, a Pi in a car drops the SMB session.
 

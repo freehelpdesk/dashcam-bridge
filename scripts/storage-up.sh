@@ -9,6 +9,10 @@ load_env
 # shellcheck source=storage-disk.sh
 source "$(dirname "${BASH_SOURCE[0]}")/storage-disk.sh"
 lock_wait
+if origin_exists; then
+  "$(dirname "${BASH_SOURCE[0]}")/gadget-down.sh" || true
+  release_dashcam_devices || die "could not release the previous dashcam disk"
+fi
 storage_prepare
 
 modprobe loop

@@ -1,0 +1,6 @@
+# STORAGE=usb and STORAGE=nvme use the drive itself. The car writes to that
+# disk. Do not mount it on /var/lib/dashcam-bridge while those settings are
+# in use. The snapshot scratch file stays on the boot disk.
+#
+# STORAGE=sd keeps the clips in cam.img on the boot disk. This file is not
+# part of that setup.

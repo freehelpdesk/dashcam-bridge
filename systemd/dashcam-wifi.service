@@ -1,0 +1,10 @@
+[Unit]
+Description=Best saved Wi-Fi network, or the dashcam access point
+After=NetworkManager.service
+Wants=NetworkManager.service
+ConditionPathExists=/etc/dashcam-bridge.env
+
+[Service]
+Type=oneshot
+TimeoutStartSec=90
+ExecStart=/usr/local/lib/dashcam-bridge/wifi.sh

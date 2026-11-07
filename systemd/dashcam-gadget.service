@@ -1,0 +1,14 @@
+[Unit]
+Description=USB drive presented to the car
+After=dashcam-storage.service
+Requires=dashcam-storage.service
+ConditionPathExists=/etc/dashcam-bridge.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/dashcam-bridge/gadget-up.sh
+ExecStop=/usr/local/lib/dashcam-bridge/gadget-down.sh
+
+[Install]
+WantedBy=multi-user.target

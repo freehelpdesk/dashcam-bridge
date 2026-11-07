@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh the dashcam share view
+After=dashcam-storage.service dashcam-gadget.service
+ConditionPathExists=/etc/dashcam-bridge.env
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+ExecStart=/usr/local/lib/dashcam-bridge/storage-refresh.sh

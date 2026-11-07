@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the dashcam share
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=2
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,8 @@
+# BEGIN dashcam-bridge
+# The USB-C port (Pi 4 and Pi 5) is the drive the car writes to.
+# The USB-A ports stay host ports.
+[cm4]
+otg_mode=0
+[all]
+dtoverlay=dwc2,dr_mode=peripheral
+# END dashcam-bridge

@@ -1,0 +1,15 @@
+[Unit]
+Description=Dashcam backing store and snapshot
+After=local-fs.target
+Before=dashcam-gadget.service
+ConditionPathExists=/etc/dashcam-bridge.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=7200
+ExecStart=/usr/local/lib/dashcam-bridge/storage-up.sh
+ExecStop=/usr/local/lib/dashcam-bridge/storage-down.sh
+
+[Install]
+WantedBy=multi-user.target

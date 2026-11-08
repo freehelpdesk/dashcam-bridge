@@ -32,9 +32,31 @@ The SMB user is `dashcam` unless you changed `SMB_USER`. The password is `SMB_PA
 
 Copy `SavedClips` and `SentryClips` when you want to keep something. `RecentClips` is the last stretch of driving and will age out.
 
-`SHARE=live` is the default, and that share is writable. A file you put there is on the drive the car sees. Eject the USB disk on any computer that had it open before you write, and do not write while the car has that disk open. A file copied onto the USB disk shows up after you disconnect from the share, within a couple of seconds. While a copy or playback is running, the Pi keeps the files cached so several clips can load together. Play them from the house Wi-Fi or Ethernet. The Pi's own access point is one radio and is the slow path for more than one clip.
+`SHARE=snapshot` is the default. The share is a frozen, read-only view that updates about once a minute, and only while nobody is connected. Play clips from the house Wi-Fi or Ethernet. The Pi's own access point is one radio and is the slow path for more than one clip.
 
-`SHARE=snapshot` stays read-only. It is a frozen view that updates about once a minute, and only while nobody is connected.
+## Write files to the drive
+
+Connect to the inbox share and drop files in, using the path you want on the drive. A file at `Boombox/horn.wav` in the inbox lands at `Boombox/horn.wav` on the drive.
+
+```text
+smb://dashcam.local/dashcam-inbox
+```
+
+A file stays in the inbox until it is on the drive, so an empty inbox means everything was written. To cancel, delete the file before it goes. A file with the same name as one on the drive replaces it. The inbox adds and replaces files. It cannot delete anything from the drive.
+
+The car and the Pi never write the drive at the same time. The Pi waits until nothing has changed in the inbox for a minute and the car has written nothing for two minutes. Then it disconnects the USB drive from the car, copies the files, and reconnects it. The car may briefly report that the USB drive is missing. While the car is driving or Sentry is recording, it keeps writing, so files wait until it stops.
+
+Each write takes at most about a minute, and anything left over goes at the next idle moment. If the power is cut partway through, the files are still in the inbox and are written again. The view on the `dashcam` share shows new files at its next update after you disconnect. `status.sh` shows how many files are waiting, and the journal lists each one:
+
+```bash
+sudo journalctl -u dashcam-inbox -b
+```
+
+A file that cannot be written, for example because the drive is full, is retried an hour later, or sooner if you add something new to the inbox.
+
+## Live mode
+
+`SHARE=live` makes the `dashcam` share itself writable, with no inbox. A file you put there is on the drive the car sees, but nothing stops the car and the Pi from writing at the same moment, and that can corrupt the drive. Eject the USB disk on any computer that had it open before you write, and do not write while the car has that disk open. A file copied onto the USB disk shows up after you disconnect from the share, within a couple of seconds.
 
 Finder may still complain about `.DS_Store`. Those files are blocked. Other files, including the `._` sidecar a Mac writes next to a clip on exFAT, go through.
 
@@ -73,9 +95,10 @@ sudo /usr/local/lib/dashcam-bridge/status.sh
 | Car says the USB drive is too slow | Expected on HW4 with a USB 2 gadget. Recordings usually still land. If clips are cut off, set `GADGET_NOFUA=1` in `/etc/dashcam-bridge.env` and reboot. That trades away the last seconds of a clip when power drops |
 | `throttled` is not `0x0`, or the red power LED blinks | The cable is too long or too thin, or a bus-powered Pi is also feeding an SSD. Shorten the cable, or move to the separate 5 V supply in `docs/hardware.md` |
 | `dashcam.local` does not resolve | Use the address `status.sh` prints. On the access point that is `192.168.4.1`, or `10.42.0.1` if NetworkManager kept its default shared-network address |
-| Share connects and `TeslaCam` is missing | Storage did not mount. `journalctl -u dashcam-storage -b` |
-| `STORAGE=nvme` or `STORAGE=usb` fails at boot | No matching disk, the drive is under 64 GiB, or it already has partitions. Those partitions are left in place. Adopt a Tesla partition with `e2label`, or set `STORAGE=sd` |
-| A file copied over USB is absent from the share | Eject that USB disk first. With `SHARE=live`, reopen the folder after a couple of seconds. With `SHARE=snapshot`, disconnect, wait a minute, and connect again |
+| The share refuses the connection | The drive did not mount on the Pi. The car can still record to it. `journalctl -u dashcam-storage -b` |
+| `STORAGE=nvme` or `STORAGE=usb` fails at boot | No matching disk appeared within 30 seconds, the drive is under 64 GiB, or it is a new drive that already has partitions. Those partitions are left in place. Adopt a Tesla partition with `e2label`, or set `STORAGE=sd` |
+| A file copied over USB is absent from the share | Eject that USB disk first. With `SHARE=snapshot`, disconnect, wait a minute, and connect again. With `SHARE=live`, reopen the folder after a couple of seconds |
+| A file stays in the inbox | The car is still writing, the file is still open on a computer, or it could not be written. `journalctl -u dashcam-inbox -b` |
 | Copy fails near the end and `snapshot scratch` is near 100% | The scratch area filled while the car was still writing. Disconnect, let the refresh run, copy again. Raise `COW_GB` if you copy for a long time while the car records |
 | Car asks to format on every plug | Stop the stack, delete the image, set `IMAGE_FS=exfat`, start it again (commands below). Let the car format once after that |
 | Access point never appears | `WIFI_COUNTRY` is unset or wrong. Fix it in `/etc/dashcam-bridge.env` and rerun provision. `raspi-config` also sets the country |
@@ -96,7 +119,9 @@ A blank drive is partitioned ext4 and labeled `TESLA`. A drive that already hold
 sudo e2label /dev/sda1 TESLA
 ```
 
-`/dev/nvme0n1p1` is the usual internal NVMe partition. If the Pi boots from that disk, the clips stay in the image file so the OS is not erased. Two USB disks at once need the one you want labeled `TESLA`.
+`/dev/nvme0n1p1` is the usual internal NVMe partition. If the Pi boots from that disk, the clips stay in the image file so the OS is not erased. The exception is a separate partition on the boot disk labeled `TESLA`: the car gets that partition and nothing else. Two USB disks at once need the one you want labeled `TESLA`.
+
+The Pi remembers the disk it gave the car by its hardware serial number, so the car reformatting that disk does not lock it out. A different disk is treated as new.
 
 ## Recreate the drive image
 
@@ -116,6 +141,6 @@ With `STORAGE=usb` or `STORAGE=nvme` the clips are on that disk, not in `cam.img
 
 ## Passwords and the LAN
 
-Each saved network can reach the share. Anyone on the house LAN, or on the car's Starlink, who has `SMB_PASSWORD` can read the footage. Pick a real password. The access point is WPA2 with `AP_PSK`. Leave port 445 closed on every router. The share is for those networks and the access point, not for the public internet.
+Each saved network can reach the share. Anyone on the house LAN, or on the car's Starlink, who has `SMB_PASSWORD` can read the footage and add or replace files through the inbox. With `SHARE=live` they can also delete it. Pick a real password. The access point is WPA2 with `AP_PSK`. Leave port 445 closed on every router. The share is for those networks and the access point, not for the public internet.
 
 After the first provision, passwords live in `/etc/dashcam-bridge.env`. Edit that file and run `sudo ./scripts/provision.sh` again to apply a new SMB or Wi-Fi password. A reboot is required only when `config.txt` changed, and the script says so.

@@ -1,0 +1,12 @@
+[Unit]
+Description=Write files from the inbox share to the dashcam drive
+After=dashcam-storage.service dashcam-gadget.service
+ConditionPathExists=/etc/dashcam-bridge.env
+
+[Service]
+Type=oneshot
+TimeoutStartSec=300
+# Runs every 15 seconds and usually finds nothing to do. Each write and each
+# failure is logged at notice or above, so it still shows in the journal.
+LogLevelMax=notice
+ExecStart=/usr/local/lib/dashcam-bridge/inbox-apply.sh

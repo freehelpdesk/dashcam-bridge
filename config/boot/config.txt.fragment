@@ -3,6 +3,10 @@
 # The USB-A ports stay host ports.
 [cm4]
 otg_mode=0
+# A Pi 5 limits its USB-A ports to 600 mA unless the supply negotiates 5 A,
+# which a car port is unlikely to do. This raises the limit to 1.6 A.
+[pi5]
+usb_max_current_enable=1
 [all]
 dtoverlay=dwc2,dr_mode=peripheral
 # END dashcam-bridge

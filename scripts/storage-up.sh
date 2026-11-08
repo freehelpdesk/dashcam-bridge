@@ -25,14 +25,36 @@ storage_ensure_cow() {
   if [[ -f $COW ]] && [[ $(stat -c %s "$COW") -ge $cow_bytes ]]; then
     return 0
   fi
-  if [[ ${STORAGE_RAW:-0} == 1 ]]; then
-    avail=$(df -BG --output=avail "$IMAGE_DIR" | tail -1 | tr -dc '0-9')
-    need=$((COW_GB + 1))
-    if ((${avail:-0} < need)); then
-      die "need ${need} GiB free on the boot disk for snapshot scratch, have ${avail:-0} GiB."
-    fi
+  avail=$(df -BG --output=avail "$IMAGE_DIR" | tail -1 | tr -dc '0-9')
+  need=$((COW_GB + 1))
+  if ((${avail:-0} < need)); then
+    die "need ${need} GiB free on the boot disk for snapshot scratch, have ${avail:-0} GiB."
   fi
   truncate -s "${COW_GB}G" "$COW"
+}
+
+# Run a step that must not stop the boot, and report it if it fails.
+storage_try() {
+  local message=$1 rc
+  shift
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  rc=$?
+  set -e
+  if ((rc != 0)); then
+    warn "$message"
+  fi
+}
+
+# Recording matters more than the shares. A filesystem Samba cannot mount must
+# not keep the USB drive from coming up. Samba refuses connections to a share
+# until its mount exists.
+storage_finish() {
+  storage_try "the share is not mounted, but the USB drive will still come up for the car" mount_share
+  storage_try "the inbox is not available, but the USB drive will still come up for the car" inbox_up
 }
 
 storage_attach() {
@@ -67,21 +89,12 @@ storage_present() {
   dmsetup create dashcam-origin --table "0 ${sz} snapshot-origin ${ORIGIN_LOOP}"
 }
 
-if origin_exists; then
-  if [[ ! -f $STATE_DIR/loops ]]; then
-    storage_ensure_cow
-    storage_attach
-  fi
-  mount_share
-  exit 0
-fi
-
 mkdir -p "$IMAGE_DIR"
 if [[ ${STORAGE_RAW:-0} == 1 ]]; then
   storage_ensure_cow
   storage_attach
   storage_present "$(blockdev --getsz "$ORIGIN_LOOP")"
-  mount_share
+  storage_finish
   exit 0
 fi
 
@@ -94,7 +107,7 @@ if [[ ! -f $IMAGE ]]; then
   if [[ $SHARE == live ]]; then
     need=$((IMAGE_GB + 1))
   else
-    need=$((IMAGE_GB + COW_GB + 2))
+    need=$((IMAGE_GB + COW_GB + INBOX_GB + 2))
   fi
   if ((avail < need)); then
     die "need ${need} GiB free in $IMAGE_DIR, have ${avail} GiB. Lower IMAGE_GB or use a larger card."
@@ -102,12 +115,7 @@ if [[ ! -f $IMAGE ]]; then
   log "creating ${IMAGE_GB} GiB ${IMAGE_FS} image"
   partial="${IMAGE}.partial"
   truncate -s "${IMAGE_GB}G" "$partial"
-  parted -s "$partial" mklabel msdos
-  if [[ $IMAGE_FS == exfat ]]; then
-    parted -s "$partial" mkpart primary ntfs 1MiB 100%
-  else
-    parted -s "$partial" mkpart primary ext4 1MiB 100%
-  fi
+  storage_make_tesla_part "$partial"
   seed=$(losetup --find --show --partscan --sector-size 512 "$partial")
   part=${seed}p1
   udevadm settle || true
@@ -117,19 +125,7 @@ if [[ ! -f $IMAGE ]]; then
     sleep 0.1
   done
   [[ -b $part ]] || die "partition $part did not appear"
-  if [[ $IMAGE_FS == exfat ]]; then
-    mkfs.exfat -n TESLA "$part"
-  else
-    mkfs.ext4 -F -L TESLA -m 0 -E lazy_itable_init=1,lazy_journal_init=1 "$part"
-  fi
-  mkdir -p /mnt/dashcam-seed
-  mount "$part" /mnt/dashcam-seed
-  mkdir -p /mnt/dashcam-seed/TeslaCam/RecentClips
-  mkdir -p /mnt/dashcam-seed/TeslaCam/SavedClips
-  mkdir -p /mnt/dashcam-seed/TeslaCam/SentryClips
-  sync
-  umount /mnt/dashcam-seed
-  rmdir /mnt/dashcam-seed
+  storage_make_tesla_fs "$part"
   losetup -d "$seed" || {
     partx -d "$seed" || true
     losetup -d "$seed"
@@ -141,4 +137,4 @@ fi
 storage_ensure_cow
 storage_attach
 storage_present "$(blockdev --getsz "$ORIGIN_LOOP")"
-mount_share
+storage_finish

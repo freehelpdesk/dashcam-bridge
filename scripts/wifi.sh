@@ -196,6 +196,13 @@ if ((${#NET_SSID[@]})) && scan_saved_networks; then
       fi
       log "could not join ${TRY_SSID[$i]}"
     done
+    # Trying another network dropped this one, and saved profiles do not
+    # autoconnect. Without this the Pi is offline until the next check.
+    if ((WIFI_STAY)) && ! nmcli --wait 25 connection up "$active"; then
+      log "could not rejoin $active"
+      WIFI_STAY=0
+      active=""
+    fi
   fi
   if ((WIFI_STAY)); then
     quiet_radio
@@ -212,7 +219,10 @@ if ethernet_up; then
   exit 0
 fi
 
-if [[ $active == "dashcam-ap" ]]; then
+# Either the access point is already up, or the Pi is on a working network this
+# script did not set up, such as the Wi-Fi entered in Raspberry Pi Imager.
+# Replacing that with the access point would cut off an SSH session.
+if [[ -n $active ]]; then
   exit 0
 fi
 

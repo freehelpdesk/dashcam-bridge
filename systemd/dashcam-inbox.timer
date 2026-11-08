@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the inbox share for files to write to the dashcam drive
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=15
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

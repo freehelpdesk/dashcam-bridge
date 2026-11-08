@@ -63,6 +63,10 @@ Switch that supply with the ignition, or accept that an always-on Pi is a drain 
 
 A Pi 5 on a car USB port often logs undervoltage and will throttle. An NVMe HAT makes that worse. Give a Pi 5 the separate supply.
 
+**How much the car's port can give.** With `POWER_SOURCE=bus`, the Pi requests 500 mA from the car, the most USB 2 lets a device ask for. That number is a request and does not limit the Pi. A bare Pi 4 typically draws 0.6 A idle and up to 1.25 A under load, so it already takes more than it asked for. The real limit is what the port and cable can deliver before the voltage falls below about 4.63 V, which is where the Pi logs undervoltage. Software cannot raise that. A shorter, thicker cable can.
+
+A Pi 5 also limits its USB-A ports to 600 mA unless its supply negotiates 5 A, and provision raises that to 1.6 A. A Pi 4 has a fixed 1.2 A limit. An SSD on those ports takes its current from the car's port too, so the higher limit makes a brown-out more likely on a weak port. `status.sh` shows the requested current and, on a Pi 5, the live supply voltage.
+
 ## Storage
 
 The car writes all day. That write stream should land on an endurance microSD, or on an SSD / NVMe when the power budget allows.

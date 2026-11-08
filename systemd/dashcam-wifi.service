@@ -6,5 +6,6 @@ ConditionPathExists=/etc/dashcam-bridge.env
 
 [Service]
 Type=oneshot
-TimeoutStartSec=90
+# Up to eight networks at 25 s each, then the access point on two bands.
+TimeoutStartSec=300
 ExecStart=/usr/local/lib/dashcam-bridge/wifi.sh

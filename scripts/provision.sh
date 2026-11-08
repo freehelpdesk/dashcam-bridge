@@ -126,7 +126,16 @@ EOF
 if [[ -f /etc/samba/smb.conf && ! -f /etc/samba/smb.conf.pre-dashcam ]]; then
   cp -a /etc/samba/smb.conf /etc/samba/smb.conf.pre-dashcam
 fi
-sed "s/__SMB_USER__/${SMB_USER}/g" "$REPO/config/smb.conf" >/etc/samba/smb.conf
+share_read_only=no
+inbox_available=no
+if [[ $SHARE == snapshot ]]; then
+  share_read_only=yes
+  ((INBOX_GB == 0)) || inbox_available=yes
+fi
+sed -e "s/__SMB_USER__/${SMB_USER}/g" \
+  -e "s/__SHARE_READ_ONLY__/${share_read_only}/g" \
+  -e "s/__INBOX_AVAILABLE__/${inbox_available}/g" \
+  "$REPO/config/smb.conf" >/etc/samba/smb.conf
 testparm -s /etc/samba/smb.conf >/dev/null
 
 if ! id "$SMB_USER" >/dev/null 2>&1; then
@@ -151,12 +160,25 @@ psk_hex() {
   printf '%s' "$hex"
 }
 
+# Keep a profile's UUID, so a rerun edits it in place. Deleting a profile would
+# drop the network that an SSH session running this script may be using.
+profile_uuid() {
+  local path=$1 uuid
+  uuid=$(awk -F= '$1 == "uuid" {print $2; exit}' "$path" 2>/dev/null || true)
+  [[ -n $uuid ]] || uuid=$(cat /proc/sys/kernel/random/uuid)
+  printf '%s' "$uuid"
+}
+
+# NetworkManager profiles are GLib key files, where a backslash is an escape.
+keyfile_value() {
+  printf '%s' "${1//\\/\\\\}"
+}
+
 write_ap() {
   local hex uuid path
   hex=$(psk_hex "$AP_SSID" "$AP_PSK")
-  uuid=$(cat /proc/sys/kernel/random/uuid)
   path=/etc/NetworkManager/system-connections/dashcam-ap.nmconnection
-  nmcli connection delete dashcam-ap >/dev/null 2>&1 || true
+  uuid=$(profile_uuid "$path")
   cat >"$path" <<EOF
 [connection]
 id=dashcam-ap
@@ -167,7 +189,7 @@ autoconnect=false
 
 [wifi]
 mode=ap
-ssid=${AP_SSID}
+ssid=$(keyfile_value "$AP_SSID")
 band=a
 channel=36
 powersave=2
@@ -193,15 +215,17 @@ write_client_networks() {
   shopt -s nullglob
   for old in /etc/NetworkManager/system-connections/dashcam-net-*.nmconnection; do
     name=$(basename "$old" .nmconnection)
+    # Only remove slots that are no longer configured.
+    [[ " ${NET_CON[*]:-} " != *" $name "* ]] || continue
     nmcli connection delete "$name" >/dev/null 2>&1 || true
     rm -f "$old"
   done
   shopt -u nullglob
   for i in "${!NET_SSID[@]}"; do
     hex=$(psk_hex "${NET_SSID[$i]}" "${NET_PSK[$i]}")
-    uuid=$(cat /proc/sys/kernel/random/uuid)
     name=${NET_CON[$i]}
     path=/etc/NetworkManager/system-connections/${name}.nmconnection
+    uuid=$(profile_uuid "$path")
     {
       printf '%s\n' \
         "[connection]" \
@@ -214,7 +238,7 @@ write_client_networks() {
         "" \
         "[wifi]" \
         "mode=infrastructure"
-      printf 'ssid=%s\n' "${NET_SSID[$i]}"
+      printf 'ssid=%s\n' "$(keyfile_value "${NET_SSID[$i]}")"
       printf '%s\n' \
         "powersave=2" \
         "" \
@@ -239,15 +263,15 @@ nmcli connection reload
 systemctl daemon-reload
 systemctl enable smbd nmbd avahi-daemon
 systemctl enable dashcam-storage.service dashcam-gadget.service dashcam-share.service
-systemctl enable dashcam-refresh.timer dashcam-wifi.timer
+systemctl enable dashcam-refresh.timer dashcam-wifi.timer dashcam-inbox.timer
 systemctl restart avahi-daemon || true
 
 if systemctl is-active --quiet dashcam-storage.service || systemctl is-active --quiet dashcam-gadget.service; then
-  systemctl stop dashcam-refresh.timer dashcam-gadget.service dashcam-storage.service
+  systemctl stop dashcam-refresh.timer dashcam-inbox.timer dashcam-gadget.service dashcam-storage.service
 fi
 storage_prepare
 
-log "SMB user ${SMB_USER} can read //dashcam.local/dashcam"
+log "SMB user ${SMB_USER} can open //dashcam.local/dashcam (SHARE=${SHARE})"
 if ((${#NET_SSID[@]})); then
   log "saved networks:"
   for i in "${!NET_SSID[@]}"; do
@@ -261,7 +285,7 @@ if ((boot_changed)); then
   log "reboot so the USB-C port becomes the dashcam drive: sudo reboot"
 else
   systemctl restart dashcam-storage.service dashcam-gadget.service dashcam-share.service
-  systemctl restart dashcam-refresh.timer
+  systemctl restart dashcam-refresh.timer dashcam-wifi.timer dashcam-inbox.timer
   systemctl start dashcam-wifi.service || true
   log "already provisioned. status: sudo ${LIB}/status.sh"
 fi

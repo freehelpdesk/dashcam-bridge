@@ -1,6 +1,6 @@
 # dashcam-bridge
 
-A Raspberry Pi that plugs into the USB port a Tesla uses for dashcam storage. The car writes its original camera files to the Pi, the same way it writes to a USB stick. The Pi serves those files over SMB. With `SHARE=live`, the share can also write the same disk.
+A Raspberry Pi that plugs into the USB port a Tesla uses for dashcam storage. The car writes its original camera files to the Pi, the same way it writes to a USB stick. The Pi serves those files over SMB as a frozen snapshot. To put a file on the drive, drop it on the `dashcam-inbox` share, and the Pi writes it once the car is idle.
 
 Nothing is transcoded. The share is the full-size copy that lives on the USB drive, which is a different thing from the smaller preview in the phone app.
 
@@ -49,7 +49,7 @@ The Pi joins the house Wi-Fi whenever that network is on, and the car's Starlink
 smb://dashcam.local/dashcam
 ```
 
-User `dashcam`, password `SMB_PASSWORD` from the env file. The folders under `TeslaCam/` are `SavedClips`, `SentryClips`, and `RecentClips`. The share shows new USB files within a couple of seconds of ejecting that disk. Day-to-day use and fixes are in [docs/operations.md](docs/operations.md).
+User `dashcam`, password `SMB_PASSWORD` from the env file. The folders under `TeslaCam/` are `SavedClips`, `SentryClips`, and `RecentClips`. The view updates about once a minute while nobody is connected. Day-to-day use and fixes are in [docs/operations.md](docs/operations.md).
 
 ## Layout
 
@@ -63,3 +63,4 @@ User `dashcam`, password `SMB_PASSWORD` from the env file. The folders under `Te
 | `config/boot/config.txt.fragment` | USB device-mode overlay |
 | `scripts/provision.sh` | Applies the config on the Pi |
 | `systemd/` | Boot services |
+| `tests/run.sh` | Logic tests that need no Pi: `bash tests/run.sh` |

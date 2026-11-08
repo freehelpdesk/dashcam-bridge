@@ -11,7 +11,9 @@ load_env
 modprobe libcomposite
 modprobe dwc2 || true
 
-if [[ -d $GADGET_ROOT && -s $GADGET_ROOT/UDC ]]; then
+# Read the value. configfs reports every attribute as 4096 bytes, so -s is
+# true even for a gadget that never bound.
+if [[ -d $GADGET_ROOT && -n $(cat "$GADGET_ROOT/UDC" 2>/dev/null) ]]; then
   exit 0
 fi
 
@@ -44,9 +46,9 @@ if [[ $POWER_SOURCE == external ]]; then
   echo 2 >"$G/configs/c.1/MaxPower"
 else
   echo 0x80 >"$G/configs/c.1/bmAttributes"
-  # configfs stores MaxPower in USB's 2 mA units, and the field maxes out at 255.
-  # 250 asks the port for 500 mA, the USB 2 high-power ceiling.
-  echo 250 >"$G/configs/c.1/MaxPower"
+  # configfs takes milliamps and the kernel encodes the descriptor itself.
+  # 500 mA is the USB 2 high-power ceiling.
+  echo 500 >"$G/configs/c.1/MaxPower"
 fi
 
 mkdir -p "$G/functions/mass_storage.0"

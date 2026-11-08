@@ -21,7 +21,7 @@ fi
 if smb_busy; then
   if pct=$(cow_percent); then
     if ((pct >= 70)); then
-      log "snapshot scratch is ${pct}% full while a client is connected"
+      warn "snapshot scratch is ${pct}% full while a client is connected"
     fi
   fi
   exit 0

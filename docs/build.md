@@ -30,7 +30,7 @@ Provision installs Debian packages and writes boot config. There is no kernel bu
 | Frozen view of the live drive | `dm-snapshot` | loaded by `storage-up.sh` |
 | The drive the car writes | `ext4` or `exfat` | used to format `cam.img` |
 
-`dr_mode=peripheral` is required on Pi 4 and Pi 5. Those boards do not wire the OTG ID pin, so the controller will not choose device mode on its own. The overlay is `config/boot/config.txt.fragment`. Provision inserts it between `# BEGIN dashcam-bridge` and `# END dashcam-bridge`, and comments out a conflicting `otg_mode=1` or a second `dtoverlay=dwc2` line. On a Compute Module 4 the fragment also sets `otg_mode=0`.
+`dr_mode=peripheral` is required on Pi 4 and Pi 5. Those boards do not wire the OTG ID pin, so the controller will not choose device mode on its own. The overlay is `config/boot/config.txt.fragment`. Provision inserts it between `# BEGIN dashcam-bridge` and `# END dashcam-bridge`, and comments out a conflicting `otg_mode=1` or a second `dtoverlay=dwc2` line. On a Compute Module 4 the fragment also sets `otg_mode=0`. On a Pi 5 it sets `usb_max_current_enable=1`, so a USB disk can draw more than 600 mA without a 5 A supply.
 
 The kernel command line gains `modules-load=dwc2,libcomposite` if those names are not already there. `cmdline.txt` is a single line. Provision keeps the rest of it.
 
@@ -73,11 +73,13 @@ Set these before you run it. Provision refuses the `CHANGEME` placeholders.
 | `WIFI_NET_1_SSID`, `WIFI_NET_1_PSK`, `WIFI_NET_1_PRIORITY` | First saved network. Use the house, priority `100`, so it wins whenever it is on |
 | `WIFI_NET_2_*` … `WIFI_NET_8_*` | More networks, such as the car's Starlink. A lower priority is used only when every higher one is out of range. The same priority on two networks picks the stronger signal. A blank priority is 100, 90, 80, … from slot 1 downward |
 | `AP_SSID`, `AP_PSK` | Fallback network the Pi broadcasts. Password, 8 or more characters |
-| `SMB_USER`, `SMB_PASSWORD` | Read-only share login. Default user `dashcam` |
+| `SMB_USER`, `SMB_PASSWORD` | Login for the `dashcam` and `dashcam-inbox` shares. Default user `dashcam` |
 | `STORAGE` | `sd` (default) keeps clips on the boot disk. `nvme` uses an internal NVMe. `usb` uses an external USB disk |
 | `IMAGE_GB` | Size of the image file the car sees when `STORAGE=sd`. Default 128. Minimum 64. On USB or NVMe the car sees the whole drive |
-| `SHARE` | `live` (default) shows new USB files within a couple of seconds. `snapshot` keeps a frozen view for a long copy |
+| `SHARE` | `snapshot` (default) is a frozen read-only view, with writes going through the inbox. `live` lets SMB write the disk directly, at the risk of corrupting it while the car writes |
 | `COW_GB` | Scratch space for `SHARE=snapshot`. Default 16. Unused when `SHARE=live` |
+| `INBOX_GB` | Size of the `dashcam-inbox` share on the boot disk. Default 4. `0` turns it off |
+| `INBOX_IDLE_SECS`, `INBOX_SETTLE_SECS`, `INBOX_MAX_SECS` | How long the car must be idle, how long the inbox must be unchanged, and the time limit for each write. Defaults 120, 60, 60 |
 | `IMAGE_FS` | `ext4` (default) or `exfat` |
 | `GADGET_NOFUA` | `0` flushes writes. `1` is faster and can drop the tail of a clip when power dies |
 | `POWER_SOURCE` | `bus` for the one-cable Pi 4. `external` when a GPIO supply powers the board |
@@ -94,9 +96,10 @@ After reboot the first start of `dashcam-storage.service` creates the drive the 
 | `dashcam-gadget.service` | Exports `/dev/mapper/dashcam-origin` as a USB drive on the USB-C port |
 | `dashcam-share.service` | Restarts Samba once the snapshot is mounted |
 | `dashcam-refresh.timer` | Every two seconds, drops the cache so `SHARE=live` shows new USB writes. `SHARE=snapshot` still replaces its frozen view about once a minute |
+| `dashcam-inbox.timer` | Every 15 seconds, writes settled inbox files to the drive if the car is idle |
 | `dashcam-wifi.timer` | Every two minutes, joins the best saved network that is actually on. Otherwise starts the access point, trying 5 GHz and falling back to 2.4 GHz |
 
-The car writes the disk through the gadget. With `SHARE=live`, Samba uses that same disk and can write it. Do not write from SMB while the car has the disk open. With `SHARE=snapshot`, Samba reads a frozen read-only view so a long copy is not cut while the car keeps writing.
+The car writes the disk through the gadget. With `SHARE=snapshot`, Samba reads a frozen read-only view so a long copy is not cut while the car keeps writing, and writes wait in the inbox until the Pi can safely take the drive for a moment. With `SHARE=live`, Samba uses that same disk and can write it. Do not write from SMB while the car has the disk open.
 
 The share definition is `config/smb.conf`. It requires the SMB user and refuses the connection if `/mnt/dashcam` is not mounted. Finder's `.DS_Store` writes are vetoed.
 

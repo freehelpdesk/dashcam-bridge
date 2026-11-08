@@ -11,6 +11,8 @@ FSTAB_END='# END dashcam-bridge disk'
 FSTAB_BEGIN_OLD='# BEGIN dashcam-bridge nvme'
 FSTAB_END_OLD='# END dashcam-bridge nvme'
 FSTAB_FILE=${FSTAB_FILE:-/etc/fstab}
+# How long to wait for a USB or NVMe disk to appear during boot.
+STORAGE_WAIT_SECS=${STORAGE_WAIT_SECS:-30}
 
 storage_bytes_needed() {
   echo $(( (IMAGE_GB + COW_GB + 2) * 1024 * 1024 * 1024 ))
@@ -235,7 +237,8 @@ classify_boot_disk() {
   done
   NVME_DISK=$disk
   if [[ -n $found ]]; then
-    NVME_MODE=use
+    # Only this partition goes to the car. The rest of the disk is the OS.
+    NVME_MODE=use_part
     NVME_PART=$found
     NVME_SIZE=${P_SIZE[$found]}
     return 0
@@ -481,22 +484,20 @@ storage_disk_big_enough() {
   ((have >= TESLA_MIN_BYTES))
 }
 
-# Partition the whole device as the drive the car sees. No image file.
-storage_format_tesla_disk() {
-  local disk=/dev/$1 part title
-  title=$(storage_kind_title "${STORAGE_KIND:-nvme}")
-  if ! storage_disk_big_enough "$NVME_SIZE"; then
-    die "$title $disk has $((NVME_SIZE / 1024 / 1024 / 1024)) GiB. Tesla's floor is 64 GiB."
-  fi
-  storage_unmount_disk "$1"
-  log "formatting $disk as the Tesla drive"
-  parted -s "$disk" mklabel msdos
+# One MBR partition across the target, which is a disk or an image file.
+storage_make_tesla_part() {
+  local target=$1
+  parted -s "$target" mklabel msdos
   if [[ $IMAGE_FS == exfat ]]; then
-    parted -s "$disk" mkpart primary ntfs 1MiB 100%
+    parted -s "$target" mkpart primary ntfs 1MiB 100%
   else
-    parted -s "$disk" mkpart primary ext4 1MiB 100%
+    parted -s "$target" mkpart primary ext4 1MiB 100%
   fi
-  part=$(storage_wait_part "$disk")
+}
+
+# Make the filesystem the car expects, with the folders it looks for.
+storage_make_tesla_fs() {
+  local part=$1
   if [[ $IMAGE_FS == exfat ]]; then
     mkfs.exfat -n "$TESLA_LABEL" "$part"
   else
@@ -510,7 +511,43 @@ storage_format_tesla_disk() {
   sync
   umount /mnt/dashcam-seed
   rmdir /mnt/dashcam-seed
+}
+
+# Partition the whole device as the drive the car sees. No image file.
+storage_format_tesla_disk() {
+  local disk=/dev/$1 part title
+  title=$(storage_kind_title "${STORAGE_KIND:-nvme}")
+  if ! storage_disk_big_enough "$NVME_SIZE"; then
+    die "$title $disk has $((NVME_SIZE / 1024 / 1024 / 1024)) GiB. Tesla's floor is 64 GiB."
+  fi
   storage_unmount_disk "$1"
+  log "formatting $disk as the Tesla drive"
+  storage_make_tesla_part "$disk"
+  part=$(storage_wait_part "$disk")
+  storage_make_tesla_fs "$part"
+  storage_unmount_disk "$1"
+}
+
+# The hardware identity of a disk. It survives the car reformatting the drive,
+# which replaces the label this project otherwise goes by.
+storage_disk_id() {
+  lsblk -dn -o WWN,SERIAL "/dev/$1" 2>/dev/null | awk '{$1=$1; print; exit}' || true
+}
+
+storage_disk_remembered() {
+  local id file=$IMAGE_DIR/claimed-disk
+  [[ -f $file ]] || return 1
+  id=$(storage_disk_id "$1")
+  [[ -n $id && $id == "$(cat "$file")" ]]
+}
+
+storage_remember_disk() {
+  local id
+  storage_disk_remembered "$1" && return 0
+  id=$(storage_disk_id "$1")
+  # Some USB bridges report no identity. Those disks fall back to the label.
+  [[ -n $id ]] || return 0
+  printf '%s\n' "$id" >"$IMAGE_DIR/claimed-disk"
 }
 
 storage_claim_disk() {
@@ -521,8 +558,16 @@ storage_claim_disk() {
         NVME_SIZE=${D_SIZE[$name]}
       fi
       storage_format_tesla_disk "$name"
+      storage_remember_disk "$name"
       ;;
-    use) storage_unmount_disk "$name" ;;
+    use)
+      storage_unmount_disk "$name"
+      storage_remember_disk "$name"
+      ;;
+    use_part)
+      name=$NVME_PART
+      storage_unmount_disk "$name"
+      ;;
     *) die "internal error: cannot prepare disk mode $NVME_MODE" ;;
   esac
   STORAGE_RAW=1
@@ -540,15 +585,33 @@ storage_release_host_mount() {
 }
 
 storage_use_extra() {
-  local kind=$1 rows title
+  local kind=$1 rows title tries=0
   STORAGE_KIND=$kind
   STORAGE_RAW=0
   DATA_DISK=""
   title=$(storage_kind_title "$kind")
   storage_release_host_mount
-  rows=$(storage_lsblk_rows) || die "could not list disks"
-  storage_root_names
-  classify_disk "$kind" "$ROOT_DISK" "$ROOT_PART" <<<"$rows"
+  # A USB disk can still be spinning up when this runs at boot.
+  while true; do
+    udevadm settle >/dev/null 2>&1 || true
+    rows=$(storage_lsblk_rows) || die "could not list disks"
+    storage_root_names
+    classify_disk "$kind" "$ROOT_DISK" "$ROOT_PART" <<<"$rows"
+    if [[ $NVME_MODE != none ]] || ((tries >= STORAGE_WAIT_SECS)); then
+      break
+    fi
+    if ((tries == 0)); then
+      log "waiting up to ${STORAGE_WAIT_SECS}s for the ${title}"
+    fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  # The car may have reformatted the disk this Pi gave it, which drops the
+  # TESLA label. That disk is still the car's drive, not someone else's data.
+  if [[ $NVME_MODE == refuse && -n $NVME_DISK && -n $ROOT_DISK ]] && storage_disk_remembered "$NVME_DISK"; then
+    log "/dev/${NVME_DISK} lost its ${TESLA_LABEL} label but is the disk already in use. Keeping it."
+    NVME_MODE=use
+  fi
   case $NVME_MODE in
     none)
       if [[ $kind == usb ]]; then
@@ -562,7 +625,7 @@ storage_use_extra() {
     boot)
       log "the ${title} is the boot disk, so clips stay in the image file at $IMAGE_DIR"
       ;;
-    format|format_part|use)
+    format|format_part|use|use_part)
       storage_require_idle
       storage_claim_disk "$NVME_DISK"
       ;;

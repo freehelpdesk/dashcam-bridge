@@ -6,4 +6,8 @@ ConditionPathExists=/etc/dashcam-bridge.env
 [Service]
 Type=oneshot
 TimeoutStartSec=120
+# This runs every two seconds. Without the filter that is about 130,000 routine
+# journal lines a day on the SD card. Failures still log. For the full output
+# of a failing run, start storage-refresh.sh by hand.
+LogLevelMax=notice
 ExecStart=/usr/local/lib/dashcam-bridge/storage-refresh.sh

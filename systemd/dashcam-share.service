@@ -1,6 +1,6 @@
 [Unit]
-Description=Reload Samba once the dashcam snapshot is mounted
-After=dashcam-storage.service smbd.service
+Description=Mount the dashcam share and reload Samba
+After=dashcam-storage.service dashcam-gadget.service smbd.service
 Requires=dashcam-storage.service
 Wants=smbd.service
 ConditionPathExists=/etc/dashcam-bridge.env
@@ -8,6 +8,7 @@ ConditionPathExists=/etc/dashcam-bridge.env
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+ExecStartPre=/usr/local/lib/dashcam-bridge/share-up.sh
 ExecStart=/usr/bin/systemctl reload-or-restart smbd.service
 
 [Install]

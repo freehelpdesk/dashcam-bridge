@@ -431,6 +431,50 @@ mount_share() {
   log "share mounted ($fstype, $(findmnt -n -o OPTIONS --mountpoint "$MNT" 2>/dev/null || echo unknown))"
 }
 
+# Filter config.txt on stdin. The Pi has no camera or display to look for, and
+# the firmware should not spend boot time probing for them.
+boot_config_tuned() {
+  sed -E 's/^(camera_auto_detect|display_auto_detect)=1$/\1=0/'
+}
+
+# Filter a Pi 5 bootloader config on stdin. Every start in the car is a cold
+# boot, so drop the network-install screen and skip power negotiation. The new
+# line stays in the [all] part, ahead of any conditional section.
+eeprom_boot_tuned() {
+  local psu_max_current=$1
+  awk -v psu="PSU_MAX_CURRENT=${psu_max_current}" '
+    /^NET_INSTALL_AT_POWER_ON=/ || /^PSU_MAX_CURRENT=/ {next}
+    /^\[/ && $0 != "[all]" && !done {print psu; done=1}
+    {print}
+    END {if (!done) print psu}
+  '
+}
+
+# Run a step that must not stop the car's drive, and report it if it fails.
+storage_try() {
+  local message=$1 rc
+  shift
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  rc=$?
+  set -e
+  if ((rc != 0)); then
+    warn "$message"
+  fi
+}
+
+# The last step before the USB drive goes to the car. Live mode has to mount
+# here, because replaying the journal or repairing the filesystem is only safe
+# before the car can write. Snapshot mode mounts its own copy-on-write view,
+# so share-up.sh does that later and the car does not wait for it.
+storage_finish() {
+  [[ $SHARE == live ]] || return 0
+  storage_try "the share is not mounted, but the USB drive will still come up for the car" mount_share
+}
+
 live_refresh() {
   # The car writes underneath this mount, so the kernel's cached directory
   # entries go stale. Dropping them (2 = dentries and inodes) shows new files.

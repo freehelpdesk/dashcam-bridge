@@ -33,30 +33,6 @@ storage_ensure_cow() {
   truncate -s "${COW_GB}G" "$COW"
 }
 
-# Run a step that must not stop the boot, and report it if it fails.
-storage_try() {
-  local message=$1 rc
-  shift
-  set +e
-  (
-    set -e
-    "$@"
-  )
-  rc=$?
-  set -e
-  if ((rc != 0)); then
-    warn "$message"
-  fi
-}
-
-# Recording matters more than the shares. A filesystem Samba cannot mount must
-# not keep the USB drive from coming up. Samba refuses connections to a share
-# until its mount exists.
-storage_finish() {
-  storage_try "the share is not mounted, but the USB drive will still come up for the car" mount_share
-  storage_try "the inbox is not available, but the USB drive will still come up for the car" inbox_up
-}
-
 storage_attach() {
   if [[ ${STORAGE_RAW:-0} == 1 ]]; then
     [[ -b ${DATA_DISK:-} ]] || die "data disk ${DATA_DISK:-} is missing"

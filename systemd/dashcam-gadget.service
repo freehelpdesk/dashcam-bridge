@@ -1,7 +1,11 @@
 [Unit]
 Description=USB drive presented to the car
-After=dashcam-storage.service
+DefaultDependencies=no
+After=dashcam-storage.service systemd-modules-load.service sys-kernel-config.mount
+Wants=sys-kernel-config.mount
 Requires=dashcam-storage.service
+Before=shutdown.target
+Conflicts=shutdown.target
 ConditionPathExists=/etc/dashcam-bridge.env
 
 [Service]

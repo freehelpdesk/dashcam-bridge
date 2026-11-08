@@ -10,6 +10,8 @@ load_env
 
 modprobe libcomposite
 modprobe dwc2 || true
+# This runs early in boot, so make sure configfs is there.
+findmnt -n --mountpoint /sys/kernel/config >/dev/null || mount -t configfs configfs /sys/kernel/config
 
 # Read the value. configfs reports every attribute as 4096 bytes, so -s is
 # true even for a gadget that never bound.
@@ -60,4 +62,4 @@ echo "$GADGET_NOFUA" >"$G/functions/mass_storage.0/lun.0/nofua"
 echo /dev/mapper/dashcam-origin >"$G/functions/mass_storage.0/lun.0/file"
 ln -s "$G/functions/mass_storage.0" "$G/configs/c.1/"
 echo "$udc" >"$G/UDC"
-log "gadget bound to $udc"
+log "gadget bound to $udc, $(cut -d' ' -f1 /proc/uptime)s after the kernel started"

@@ -74,7 +74,13 @@ That tool lives in the sibling project `tesdec`. Its README covers sign-in. Decr
 
 ## When the car sleeps
 
-A one-cable Pi loses power when the car drops the USB port. The Pi turns off. The files remain on the card. On the next wake the Pi boots, then the drive reappears. The car can complain if it looks for the drive during that boot; it settles once the gadget is back. Boot is on the order of half a minute.
+A one-cable Pi loses power when the car drops the USB port. The Pi turns off. The files remain on the card. On the next wake the Pi boots, then the drive reappears. The car can complain if it looks for the drive during that boot; it settles once the gadget is back. The drive is presented early in boot, before the Pi's network and SMB share are ready, and the share follows later. To see how long the car waited:
+
+```bash
+sudo journalctl -u dashcam-gadget -b | grep bound
+```
+
+That time counts from when the kernel started. Add a few seconds for the Pi's firmware, which runs first.
 
 A Pi on a separate ignition-switched supply stays up while the car is awake and turns off with the ignition. A supply that stays on all night is a drain on the 12 V battery. The share is reachable after the car sleeps only while the Pi still has power and a network.
 
@@ -95,7 +101,7 @@ sudo /usr/local/lib/dashcam-bridge/status.sh
 | Car says the USB drive is too slow | Expected on HW4 with a USB 2 gadget. Recordings usually still land. If clips are cut off, set `GADGET_NOFUA=1` in `/etc/dashcam-bridge.env` and reboot. That trades away the last seconds of a clip when power drops |
 | `throttled` is not `0x0`, or the red power LED blinks | The cable is too long or too thin, or a bus-powered Pi is also feeding an SSD. Shorten the cable, or move to the separate 5 V supply in `docs/hardware.md` |
 | `dashcam.local` does not resolve | Use the address `status.sh` prints. On the access point that is `192.168.4.1`, or `10.42.0.1` if NetworkManager kept its default shared-network address |
-| The share refuses the connection | The drive did not mount on the Pi. The car can still record to it. `journalctl -u dashcam-storage -b` |
+| The share refuses the connection | The drive did not mount on the Pi, or it has not finished mounting since boot. The car can still record to it. `journalctl -u dashcam-share -b` |
 | `STORAGE=nvme` or `STORAGE=usb` fails at boot | No matching disk appeared within 30 seconds, the drive is under 64 GiB, or it is a new drive that already has partitions. Those partitions are left in place. Adopt a Tesla partition with `e2label`, or set `STORAGE=sd` |
 | A file copied over USB is absent from the share | Eject that USB disk first. With `SHARE=snapshot`, disconnect, wait a minute, and connect again. With `SHARE=live`, reopen the folder after a couple of seconds |
 | A file stays in the inbox | The car is still writing, the file is still open on a computer, or it could not be written. `journalctl -u dashcam-inbox -b` |
@@ -106,7 +112,7 @@ sudo /usr/local/lib/dashcam-bridge/status.sh
 Logs:
 
 ```bash
-sudo journalctl -u dashcam-storage -u dashcam-gadget -u dashcam-wifi -b
+sudo journalctl -u dashcam-storage -u dashcam-gadget -u dashcam-share -u dashcam-wifi -b
 ```
 
 ## NVMe or USB disk
@@ -131,7 +137,7 @@ This deletes every clip on the Pi. It applies when `STORAGE=sd`, and when the NV
 sudo systemctl stop dashcam-refresh.timer dashcam-gadget.service dashcam-storage.service
 sudo rm -f /var/lib/dashcam-bridge/cam.img
 # edit /etc/dashcam-bridge.env first if IMAGE_GB or IMAGE_FS should change
-sudo systemctl start dashcam-storage.service dashcam-gadget.service
+sudo systemctl start dashcam-storage.service dashcam-gadget.service dashcam-share.service
 sudo systemctl start dashcam-refresh.timer
 ```
 

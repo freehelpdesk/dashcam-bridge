@@ -70,6 +70,8 @@ patch_config() {
   ' "$src" >"$tmp"
   sed -i -E 's/^(otg_mode=1)$/# dashcam-bridge: \1/' "$tmp"
   sed -i -E 's/^(dtoverlay=dwc2.*)$/# dashcam-bridge: \1/' "$tmp"
+  boot_config_tuned <"$tmp" >"${tmp}.tuned"
+  mv "${tmp}.tuned" "$tmp"
   cat "$fragment" >>"$tmp"
   if ! cmp -s "$tmp" "$src"; then
     [[ -f ${src}.dashcam-bridge.bak ]] || cp -a "$src" "${src}.dashcam-bridge.bak"
@@ -100,8 +102,36 @@ patch_cmdline() {
   fi
 }
 
+# A bootloader problem must not fail the install, and this never forces a
+# downgrade. The Pi works the same without these settings, just a little slower.
+patch_eeprom() {
+  local current updated tmp psu=3000
+  [[ $model == *"Raspberry Pi 5 "* ]] || return 0
+  [[ $POWER_SOURCE == bus ]] || psu=5000
+  if ! command -v rpi-eeprom-config >/dev/null 2>&1; then
+    warn "rpi-eeprom-config is missing, so the bootloader boot settings were skipped"
+    return 0
+  fi
+  if ! current=$(rpi-eeprom-config 2>/dev/null) || [[ $current != *BOOT_ORDER=* ]]; then
+    warn "could not read the bootloader config, so its boot settings were skipped"
+    return 0
+  fi
+  updated=$(eeprom_boot_tuned "$psu" <<<"$current")
+  [[ $updated != "$current" ]] || return 0
+  tmp=$(mktemp)
+  printf '%s\n' "$updated" >"$tmp"
+  if rpi-eeprom-config --apply "$tmp"; then
+    boot_changed=1
+    log "updated the bootloader boot settings"
+  else
+    warn "the bootloader settings were not applied. If it refused a downgrade, upgrade the rpi-eeprom package and run provision again."
+  fi
+  rm -f "$tmp"
+}
+
 patch_config
 patch_cmdline
+patch_eeprom
 
 hostnamectl set-hostname dashcam
 if grep -q '^127\.0\.1\.1' /etc/hosts; then
@@ -282,7 +312,7 @@ else
 fi
 log "access point ${AP_SSID} uses 192.168.4.1 when none of those networks are in range"
 if ((boot_changed)); then
-  log "reboot so the USB-C port becomes the dashcam drive: sudo reboot"
+  log "reboot to apply the boot settings: sudo reboot"
 else
   systemctl restart dashcam-storage.service dashcam-gadget.service dashcam-share.service
   systemctl restart dashcam-refresh.timer dashcam-wifi.timer dashcam-inbox.timer

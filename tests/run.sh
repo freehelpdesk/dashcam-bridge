@@ -169,6 +169,73 @@ check "refresh resumes and remounts after success" "resumed mounted" "$(refresh_
 check "refresh resumes when remove fails" "resumed unmounted" "$(refresh_state remove)"
 check "refresh resumes when create fails" "resumed unmounted" "$(refresh_state create)"
 
+# --- boot order -------------------------------------------------------------
+
+if [[ -f $SCRIPTS/share-up.sh ]]; then
+  # shellcheck source=../scripts/share-up.sh
+  source "$SCRIPTS/share-up.sh"
+  set +e
+  UNITS=$SCRIPTS/../systemd
+
+  # Every step the boot code runs, in order, with an optional failing step.
+  boot_steps() { # function to run, share mode, step that fails
+    local run=$1 fail=${3:-none}
+    (
+      SHARE=$2
+      lock_wait() { :; }
+      origin_exists() { return 0; }
+      mount_share() {
+        echo mount_share
+        [[ $fail != mount_share ]]
+      }
+      inbox_up() { echo inbox_up; }
+      warn() { :; }
+      set -e
+      "$run"
+      echo finished
+    ) 2>/dev/null | tr '\n' ' '
+  }
+
+  check "snapshot mode does not mount before the car connects" "finished " "$(boot_steps storage_finish snapshot)"
+  check "live mode mounts before the car connects" "mount_share finished " "$(boot_steps storage_finish live)"
+  check "snapshot mounts the share and inbox afterward" "mount_share inbox_up finished " "$(boot_steps share_up snapshot)"
+  check "a failed share mount does not stop the inbox" "mount_share inbox_up finished " "$(boot_steps share_up snapshot mount_share)"
+  check "live mode never mounts after the car connects" "finished " "$(boot_steps share_up live)"
+
+  for unit in dashcam-storage dashcam-gadget; do
+    check "$unit starts in early boot" 1 "$(grep -c '^DefaultDependencies=no$' "$UNITS/$unit.service")"
+    check "$unit stops before shutdown" 1 "$(grep -c '^Conflicts=shutdown.target$' "$UNITS/$unit.service")"
+    check "$unit does not wait for the share or network" 0 \
+      "$(grep -E '^(After|Requires|Wants)=' "$UNITS/$unit.service" | grep -cE 'dashcam-share|smbd|network|basic.target')"
+  done
+  check "share waits for the car's drive" 1 "$(grep -E '^After=' "$UNITS/dashcam-share.service" | grep -c dashcam-gadget)"
+fi
+
+# --- boot tuning -----------------------------------------------------------
+
+if declare -F eeprom_boot_tuned >/dev/null; then
+  lines() { # stdin to one line, so a whole config compares in a single check
+    paste -s -d '|' -
+  }
+  check "config.txt detection is turned off" "camera_auto_detect=0|# keep|display_auto_detect=0|xcamera_auto_detect=1" \
+    "$(printf 'camera_auto_detect=1\n# keep\ndisplay_auto_detect=1\nxcamera_auto_detect=1\n' | boot_config_tuned | lines)"
+
+  PI_EEPROM='[all]
+BOOT_UART=1
+BOOT_ORDER=0xf461
+NET_INSTALL_AT_POWER_ON=1'
+  TUNED_EEPROM=$(eeprom_boot_tuned 3000 <<<"$PI_EEPROM")
+  check "eeprom drops the install screen and skips negotiation" \
+    "[all]|BOOT_UART=1|BOOT_ORDER=0xf461|PSU_MAX_CURRENT=3000" "$(lines <<<"$TUNED_EEPROM")"
+  check "eeprom tuning is stable on a rerun" "$TUNED_EEPROM" "$(eeprom_boot_tuned 3000 <<<"$TUNED_EEPROM")"
+  check "eeprom setting replaces an old value" \
+    "[all]|BOOT_ORDER=0xf1|PSU_MAX_CURRENT=5000" \
+    "$(printf '[all]\nPSU_MAX_CURRENT=3000\nBOOT_ORDER=0xf1\n' | eeprom_boot_tuned 5000 | lines)"
+  check "eeprom setting stays out of conditional sections" \
+    "[all]|BOOT_ORDER=0xf1|PSU_MAX_CURRENT=3000|[gpio8=0]|BOOT_ORDER=0xf7" \
+    "$(printf '[all]\nBOOT_ORDER=0xf1\n[gpio8=0]\nBOOT_ORDER=0xf7\n' | eeprom_boot_tuned 3000 | lines)"
+fi
+
 # --- mount_share -----------------------------------------------------------
 
 if declare -F map_first_partition >/dev/null; then

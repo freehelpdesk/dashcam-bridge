@@ -32,6 +32,8 @@ Provision installs Debian packages and writes boot config. There is no kernel bu
 
 `dr_mode=peripheral` is required on Pi 4 and Pi 5. Those boards do not wire the OTG ID pin, so the controller will not choose device mode on its own. The overlay is `config/boot/config.txt.fragment`. Provision inserts it between `# BEGIN dashcam-bridge` and `# END dashcam-bridge`, and comments out a conflicting `otg_mode=1` or a second `dtoverlay=dwc2` line. On a Compute Module 4 the fragment also sets `otg_mode=0`. On a Pi 5 it sets `usb_max_current_enable=1`, so a USB disk can draw more than 600 mA without a 5 A supply.
 
+To shorten boot, provision also sets `camera_auto_detect=0` and `display_auto_detect=0` in `config.txt`. On a Pi 5 it removes `NET_INSTALL_AT_POWER_ON` from the bootloader config and sets `PSU_MAX_CURRENT` to `3000` with `POWER_SOURCE=bus`, or `5000` with `POWER_SOURCE=external`. If the bootloader tool refuses, usually because the installed images are older than the running bootloader, provision prints a warning and continues. It never forces a downgrade.
+
 The kernel command line gains `modules-load=dwc2,libcomposite` if those names are not already there. `cmdline.txt` is a single line. Provision keeps the rest of it.
 
 Backups of both files, taken once, are `config.txt.dashcam-bridge.bak` and `cmdline.txt.dashcam-bridge.bak` next to the originals under `/boot/firmware`.
@@ -92,9 +94,9 @@ After reboot the first start of `dashcam-storage.service` creates the drive the 
 
 | Unit | What it does |
 | --- | --- |
-| `dashcam-storage.service` | Opens the image file or the USB/NVMe disk and mounts it at `/mnt/dashcam` |
+| `dashcam-storage.service` | Opens the image file or the USB/NVMe disk. Starts early in boot, as soon as the disks are usable. With `SHARE=live` it also mounts the disk at `/mnt/dashcam` |
 | `dashcam-gadget.service` | Exports `/dev/mapper/dashcam-origin` as a USB drive on the USB-C port |
-| `dashcam-share.service` | Restarts Samba once the snapshot is mounted |
+| `dashcam-share.service` | After the car has its drive, mounts the snapshot and the inbox, then reloads Samba |
 | `dashcam-refresh.timer` | Every two seconds, drops the cache so `SHARE=live` shows new USB writes. `SHARE=snapshot` still replaces its frozen view about once a minute |
 | `dashcam-inbox.timer` | Every 15 seconds, writes settled inbox files to the drive if the car is idle |
 | `dashcam-wifi.timer` | Every two minutes, joins the best saved network that is actually on. Otherwise starts the access point, trying 5 GHz and falling back to 2.4 GHz |
@@ -123,5 +125,5 @@ A Pi 5 powered from a laptop port may log undervoltage during this test. The dis
 
 ```bash
 sudo /usr/local/lib/dashcam-bridge/status.sh
-sudo journalctl -u dashcam-storage -u dashcam-gadget -u dashcam-wifi -b
+sudo journalctl -u dashcam-storage -u dashcam-gadget -u dashcam-share -u dashcam-wifi -b
 ```

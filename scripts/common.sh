@@ -58,6 +58,7 @@ load_env() {
   : "${SHARE:=snapshot}"
   : "${GADGET_NOFUA:=0}"
   : "${POWER_SOURCE:=bus}"
+  : "${REDUCED_POWER:=0}"
   : "${SNAP_CHUNK:=32}"
   : "${INBOX_GB:=4}"
   : "${INBOX_IDLE_SECS:=120}"
@@ -86,6 +87,7 @@ validate_env() {
   [[ $SHARE == "live" || $SHARE == "snapshot" ]] || die "SHARE must be live or snapshot"
   [[ $GADGET_NOFUA == "0" || $GADGET_NOFUA == "1" ]] || die "GADGET_NOFUA must be 0 or 1"
   [[ $POWER_SOURCE == "bus" || $POWER_SOURCE == "external" ]] || die "POWER_SOURCE must be bus or external"
+  [[ $REDUCED_POWER == "0" || $REDUCED_POWER == "1" ]] || die "REDUCED_POWER must be 0 or 1"
   [[ $SNAP_CHUNK =~ ^[1-9][0-9]*$ ]] && ! ((SNAP_CHUNK & (SNAP_CHUNK - 1))) || die "SNAP_CHUNK must be a power of two"
   [[ $INBOX_GB =~ ^[0-9]+$ ]] || die "INBOX_GB must be a number (0 turns the inbox off)"
   [[ $INBOX_IDLE_SECS =~ ^[0-9]+$ && $INBOX_SETTLE_SECS =~ ^[0-9]+$ && $INBOX_MAX_SECS =~ ^[1-9][0-9]*$ ]] || die "INBOX_IDLE_SECS, INBOX_SETTLE_SECS, and INBOX_MAX_SECS must be numbers of seconds"
@@ -429,6 +431,23 @@ mount_share() {
   [[ -n $src ]] && blockdev --setra 2048 "$src" 2>/dev/null || true
   blockdev --setra 2048 /dev/mapper/dashcam-origin 2>/dev/null || true
   log "share mounted ($fstype, $(findmnt -n -o OPTIONS --mountpoint "$MNT" 2>/dev/null || echo unknown))"
+}
+
+# Filter the config.txt fragment on stdin. These lines sit inside the managed
+# block, so setting REDUCED_POWER back to 0 removes them on the next provision.
+# Neither limit slows the car, which is capped by its USB 2 link.
+boot_fragment() {
+  local reduced=$1
+  awk -v reduced="$reduced" '
+    /^# END dashcam-bridge$/ && reduced == 1 {
+      print "# REDUCED_POWER=1 lowers the peak current of a Pi 5."
+      print "[pi5]"
+      print "arm_freq=1500"
+      print "dtparam=pciex1_gen=1"
+      print "[all]"
+    }
+    {print}
+  '
 }
 
 # Filter config.txt on stdin. The Pi has no camera or display to look for, and

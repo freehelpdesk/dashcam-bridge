@@ -236,6 +236,105 @@ NET_INSTALL_AT_POWER_ON=1'
     "$(printf '[all]\nBOOT_ORDER=0xf1\n[gpio8=0]\nBOOT_ORDER=0xf7\n' | eeprom_boot_tuned 3000 | lines)"
 fi
 
+# --- reduced power ---------------------------------------------------------
+
+if [[ -f $SCRIPTS/nvme-power.sh ]]; then
+  # shellcheck source=../scripts/nvme-power.sh
+  source "$SCRIPTS/nvme-power.sh"
+  set +e
+  FRAGMENT='# BEGIN dashcam-bridge
+[all]
+dtoverlay=dwc2,dr_mode=peripheral
+# END dashcam-bridge'
+  check "reduced power off leaves the boot block alone" "$FRAGMENT" "$(boot_fragment 0 <<<"$FRAGMENT")"
+  REDUCED_BLOCK=$(boot_fragment 1 <<<"$FRAGMENT")
+  check "reduced power limits only a Pi 5, inside the managed block" \
+    "[pi5]|arm_freq=1500|dtparam=pciex1_gen=1|[all]|# END dashcam-bridge" \
+    "$(tail -n 5 <<<"$REDUCED_BLOCK" | paste -s -d '|' -)"
+
+  ID_CTRL='vid       : 0xc0a9
+ps      0 : mp:8.00W operational enlat:0 exlat:0 rrt:0 rrl:0
+          rwt:0 rwl:0 idle_power:- active_power:-
+ps      1 : mp:4.50W operational enlat:0 exlat:0 rrt:1 rrl:1
+ps      2 : mp:3.20W operational enlat:0 exlat:0 rrt:2 rrl:2
+ps      3 : mp:0.0500W non-operational enlat:500 exlat:2000 rrt:3 rrl:3
+ps      4 : mp:0.0040W non-operational enlat:2000 exlat:40000 rrt:4 rrl:4'
+  check "lowest working power state skips sleep states" "2 3.20" "$(nvme_lowest_power_state <<<"$ID_CTRL")"
+  check "power compares as a number" "1 0.0900" \
+    "$(printf 'ps 0 : mp:10.00W operational\nps 1 : mp:0.0900W operational\nps 2 : mp:9.00W operational\n' | nvme_lowest_power_state)"
+  check "power does not compare as text" "0 9.00" \
+    "$(printf 'ps 0 : mp:9.00W operational\nps 1 : mp:10.00W operational\n' | nvme_lowest_power_state)"
+  check "an unreported maximum is not the lowest" "1 5.00" \
+    "$(printf 'ps 0 : mp:0.00W operational\nps 1 : mp:5.00W operational\n' | nvme_lowest_power_state)"
+  check "no working states gives no answer" "" \
+    "$(printf 'ps 0 : mp:0.05W non-operational\n' | nvme_lowest_power_state)"
+
+  nvme_scenario() { # reduced, controllers, id-ctrl text or "fail", set result
+    local sandbox calls=() name
+    REDUCED_POWER=$1
+    sandbox=$(mktemp -d)
+    NVME_CLASS=$sandbox
+    for name in $2; do mkdir "$sandbox/$name"; done
+    STUB_ID=$3
+    STUB_SET=${4:-0}
+    nvme() {
+      printf '%s\n' "$*" >>"$sandbox/calls"
+      case $1 in
+        id-ctrl)
+          [[ $STUB_ID != fail ]] || return 1
+          printf '%s\n' "$STUB_ID"
+          ;;
+        set-feature) return "$STUB_SET" ;;
+      esac
+    }
+    nvme_limit_power >/dev/null 2>&1
+    printf 'rc=%s %s' "$?" "$(grep -h '^set-feature' "$sandbox/calls" 2>/dev/null | paste -s -d '|' -)"
+    rm -rf "$sandbox"
+  }
+  check "reduced power off never touches the drive" "rc=0 " "$(nvme_scenario 0 nvme0 "$ID_CTRL")"
+  check "the drive is set to its lowest working state" "rc=0 set-feature /dev/nvme0 --feature-id=2 --value=2" \
+    "$(nvme_scenario 1 nvme0 "$ID_CTRL")"
+  check "every drive is limited" \
+    "rc=0 set-feature /dev/nvme0 --feature-id=2 --value=2|set-feature /dev/nvme1 --feature-id=2 --value=2" \
+    "$(nvme_scenario 1 'nvme0 nvme1' "$ID_CTRL")"
+  check "no drive is not an error" "rc=0 " "$(nvme_scenario 1 '' "$ID_CTRL")"
+  check "a drive with one working state is left alone" "rc=0 " \
+    "$(nvme_scenario 1 nvme0 'ps 0 : mp:8.00W operational')"
+  check "an unreadable drive does not fail the boot" "rc=0 " "$(nvme_scenario 1 nvme0 fail)"
+  check "a refused limit does not fail the boot" "rc=0 set-feature /dev/nvme0 --feature-id=2 --value=2" \
+    "$(nvme_scenario 1 nvme0 "$ID_CTRL" 1)"
+
+  missing_tool() {
+    local sandbox
+    sandbox=$(mktemp -d)
+    mkdir "$sandbox/nvme0"
+    REDUCED_POWER=1 NVME_CLASS=$sandbox
+    unset -f nvme
+    PATH=/nonexistent nvme_limit_power 2>&1
+    printf 'rc=%s\n' "$?"
+    /bin/rm -rf "$sandbox"
+  }
+  check "missing nvme-cli warns and carries on" \
+    "nvme-cli is missing, so the NVMe drive stays at full power. Run provision again.|rc=0" \
+    "$(missing_tool | paste -s -d '|' -)"
+
+  reduced_value() {
+    WIFI_COUNTRY=US AP_SSID=dashcam AP_PSK=password1 SMB_PASSWORD=password1 SMB_USER=dashcam
+    IMAGE_GB=128 COW_GB=16 IMAGE_FS=ext4 STORAGE=sd SHARE=snapshot GADGET_NOFUA=0 POWER_SOURCE=bus
+    SNAP_CHUNK=32 INBOX_GB=4 INBOX_IDLE_SECS=120 INBOX_SETTLE_SECS=60 INBOX_MAX_SECS=60
+    REDUCED_POWER=$1
+    (validate_env) 2>&1
+  }
+  check "reduced power accepts 1" "" "$(reduced_value 1)"
+  check "reduced power refuses other values" "REDUCED_POWER must be 0 or 1" "$(reduced_value yes)"
+
+  NVME_UNIT=$SCRIPTS/../systemd/dashcam-nvme-power.service
+  check "nvme limit is in place before the car writes" 1 "$(grep -E '^Before=' "$NVME_UNIT" | grep -c dashcam-gadget)"
+  check "a failed nvme limit cannot stop the gadget" 0 \
+    "$(grep -hE '^(Requires|Requisite|BindsTo)=' "$NVME_UNIT" "$SCRIPTS/../systemd/dashcam-gadget.service" | grep -c 'nvme-power')"
+  check "provision enables the nvme limit" 1 "$(grep -c 'enable .*dashcam-nvme-power.service' "$SCRIPTS/provision.sh")"
+fi
+
 # --- mount_share -----------------------------------------------------------
 
 if declare -F map_first_partition >/dev/null; then

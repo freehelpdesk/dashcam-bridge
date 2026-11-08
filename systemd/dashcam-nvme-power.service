@@ -1,0 +1,16 @@
+[Unit]
+Description=NVMe power limit for REDUCED_POWER
+DefaultDependencies=no
+After=systemd-udev-trigger.service systemd-modules-load.service
+Before=dashcam-gadget.service shutdown.target
+Conflicts=shutdown.target
+ConditionPathExists=/etc/dashcam-bridge.env
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=10
+ExecStart=/usr/local/lib/dashcam-bridge/nvme-power.sh
+
+[Install]
+WantedBy=multi-user.target

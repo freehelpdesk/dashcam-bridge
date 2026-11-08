@@ -18,9 +18,25 @@ if command -v vcgencmd >/dev/null 2>&1; then
       supply=$(vcgencmd pmic_read_adc 2>/dev/null | awk '/EXT5V_V/ {print $NF; exit}' || true)
       printf 'supply voltage: %s\n' "${supply:-n/a}"
       printf 'usb limit: %s\n' "$(vcgencmd get_config usb_max_current_enable 2>/dev/null || echo n/a)"
+      printf 'cpu limit: %s\n' "$(vcgencmd get_config arm_freq 2>/dev/null || echo n/a)"
       ;;
   esac
 fi
+if ((REDUCED_POWER)); then
+  printf 'reduced power: on\n'
+else
+  printf 'reduced power: off\n'
+fi
+shopt -s nullglob
+for ctrl in /sys/class/nvme/nvme*; do
+  name=${ctrl##*/}
+  state=n/a
+  if command -v nvme >/dev/null 2>&1; then
+    state=$(nvme get-feature "/dev/$name" --feature-id=2 2>/dev/null | awk -F'value:' 'NF > 1 {print $2; exit}' || true)
+  fi
+  printf '%s: %s, power state %s\n' "$name" "$(cat "$ctrl/device/current_link_speed" 2>/dev/null || echo n/a)" "${state:-n/a}"
+done
+shopt -u nullglob
 if [[ -r /sys/kernel/config/usb_gadget/dashcam/configs/c.1/MaxPower ]]; then
   printf 'usb power requested: %s mA\n' "$(cat /sys/kernel/config/usb_gadget/dashcam/configs/c.1/MaxPower)"
 fi

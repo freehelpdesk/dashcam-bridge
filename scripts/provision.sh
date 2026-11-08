@@ -45,9 +45,17 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update || die "apt-get update failed. Connect Ethernet or set Wi-Fi in Raspberry Pi Imager, then run provision again."
-apt-get install -y \
-  samba avahi-daemon exfatprogs dosfstools e2fsprogs kpartx parted \
+packages=(
+  samba avahi-daemon exfatprogs dosfstools e2fsprogs kpartx parted
   wpasupplicant iw rfkill network-manager
+)
+((REDUCED_POWER == 0)) || packages+=(nvme-cli)
+apt-get install -y "${packages[@]}"
+
+case "$model" in
+*"Pi 5"* | *"Compute Module 5"*) ;;
+*) ((REDUCED_POWER == 0)) || warn "REDUCED_POWER only changes a Raspberry Pi 5, so it has no effect on this board" ;;
+esac
 
 if [[ -f /boot/firmware/config.txt ]]; then
   BOOT=/boot/firmware
@@ -72,7 +80,7 @@ patch_config() {
   sed -i -E 's/^(dtoverlay=dwc2.*)$/# dashcam-bridge: \1/' "$tmp"
   boot_config_tuned <"$tmp" >"${tmp}.tuned"
   mv "${tmp}.tuned" "$tmp"
-  cat "$fragment" >>"$tmp"
+  boot_fragment "$REDUCED_POWER" <"$fragment" >>"$tmp"
   if ! cmp -s "$tmp" "$src"; then
     [[ -f ${src}.dashcam-bridge.bak ]] || cp -a "$src" "${src}.dashcam-bridge.bak"
     cat "$tmp" >"$src"
@@ -292,7 +300,7 @@ nmcli connection reload
 
 systemctl daemon-reload
 systemctl enable smbd nmbd avahi-daemon
-systemctl enable dashcam-storage.service dashcam-gadget.service dashcam-share.service
+systemctl enable dashcam-storage.service dashcam-gadget.service dashcam-share.service dashcam-nvme-power.service
 systemctl enable dashcam-refresh.timer dashcam-wifi.timer dashcam-inbox.timer
 systemctl restart avahi-daemon || true
 

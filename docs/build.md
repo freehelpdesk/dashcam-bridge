@@ -34,6 +34,8 @@ Provision installs Debian packages and writes boot config. There is no kernel bu
 
 To shorten boot, provision also sets `camera_auto_detect=0` and `display_auto_detect=0` in `config.txt`. On a Pi 5 it removes `NET_INSTALL_AT_POWER_ON` from the bootloader config and sets `PSU_MAX_CURRENT` to `3000` with `POWER_SOURCE=bus`, or `5000` with `POWER_SOURCE=external`. If the bootloader tool refuses, usually because the installed images are older than the running bootloader, provision prints a warning and continues. It never forces a downgrade.
 
+With `REDUCED_POWER=1` on a Pi 5, the managed block also sets `arm_freq=1500` and `dtparam=pciex1_gen=1`. Setting it back to `0` and running provision removes both.
+
 The kernel command line gains `modules-load=dwc2,libcomposite` if those names are not already there. `cmdline.txt` is a single line. Provision keeps the rest of it.
 
 Backups of both files, taken once, are `config.txt.dashcam-bridge.bak` and `cmdline.txt.dashcam-bridge.bak` next to the originals under `/boot/firmware`.
@@ -51,6 +53,7 @@ Provision installs:
 | `wpasupplicant` | hash the Wi-Fi password into the NetworkManager profile |
 | `iw`, `rfkill` | confirm the access point and turn Wi-Fi power save off |
 | `network-manager` | already on Raspberry Pi OS Bookworm and Trixie; listed so the dependency is explicit |
+| `nvme-cli` | sets the NVMe power limit. Installed only with `REDUCED_POWER=1` |
 
 Bluetooth is disabled. The Wi-Fi and Bluetooth radios share one chip, and this box only needs Wi-Fi.
 
@@ -85,6 +88,7 @@ Set these before you run it. Provision refuses the `CHANGEME` placeholders.
 | `IMAGE_FS` | `ext4` (default) or `exfat` |
 | `GADGET_NOFUA` | `0` flushes writes. `1` is faster and can drop the tail of a clip when power dies |
 | `POWER_SOURCE` | `bus` for the one-cable Pi 4. `external` when a GPIO supply powers the board |
+| `REDUCED_POWER` | `1` lowers a Pi 5's peak current by capping the CPU at 1.5 GHz, running PCIe at Gen 1, and holding an NVMe drive to its lowest-power working state. Default `0` |
 
 `POWER_SOURCE=external` changes the USB descriptor to self-powered. It does not move any wires. The wiring is in `docs/hardware.md`.
 
@@ -96,6 +100,7 @@ After reboot the first start of `dashcam-storage.service` creates the drive the 
 | --- | --- |
 | `dashcam-storage.service` | Opens the image file or the USB/NVMe disk. Starts early in boot, as soon as the disks are usable. With `SHARE=live` it also mounts the disk at `/mnt/dashcam` |
 | `dashcam-gadget.service` | Exports `/dev/mapper/dashcam-origin` as a USB drive on the USB-C port |
+| `dashcam-nvme-power.service` | With `REDUCED_POWER=1`, limits each NVMe drive before the car gets its drive. Otherwise does nothing |
 | `dashcam-share.service` | After the car has its drive, mounts the snapshot and the inbox, then reloads Samba |
 | `dashcam-refresh.timer` | Every two seconds, drops the cache so `SHARE=live` shows new USB writes. `SHARE=snapshot` still replaces its frozen view about once a minute |
 | `dashcam-inbox.timer` | Every 15 seconds, writes settled inbox files to the drive if the car is idle |

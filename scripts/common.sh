@@ -59,6 +59,20 @@ load_env() {
   : "${GADGET_NOFUA:=0}"
   : "${POWER_SOURCE:=bus}"
   : "${REDUCED_POWER:=0}"
+  : "${TELEMETRY:=0}"
+  : "${TELEMETRY_TOKEN:=}"
+  : "${TELEMETRY_PORT:=8088}"
+  : "${TELEMETRY_BIND:=0.0.0.0}"
+  : "${TELEMETRY_POLL_SECS:=10}"
+  : "${TELEMETRY_BRAKE_MPS2:=4}"
+  : "${TELEMETRY_ACCEL_MPS2:=4}"
+  : "${TELEMETRY_CORNER_MPS2:=4}"
+  : "${TELEMETRY_HOLD_MS:=250}"
+  : "${TELEMETRY_KEEP_DAYS:=30}"
+  : "${TELEMETRY_WEBHOOK_URL:=}"
+  : "${TELEMETRY_WEBHOOK_FORMAT:=json}"
+  : "${TELEMETRY_WEBHOOK_GPS:=0}"
+  : "${TELEMETRY_WRITE_LOG:=0}"
   : "${SNAP_CHUNK:=32}"
   : "${INBOX_GB:=4}"
   : "${INBOX_IDLE_SECS:=120}"
@@ -93,7 +107,32 @@ validate_env() {
   [[ $INBOX_IDLE_SECS =~ ^[0-9]+$ && $INBOX_SETTLE_SECS =~ ^[0-9]+$ && $INBOX_MAX_SECS =~ ^[1-9][0-9]*$ ]] || die "INBOX_IDLE_SECS, INBOX_SETTLE_SECS, and INBOX_MAX_SECS must be numbers of seconds"
   [[ $AP_PSK != -* ]] || die "AP_PSK cannot start with a dash"
   [[ $AP_SSID != *$'\n'* && $AP_PSK != *$'\n'* && $SMB_PASSWORD != *$'\n'* ]] || die "passwords must be a single line"
+  validate_telemetry
   load_networks
+}
+
+validate_telemetry() {
+  local name value
+  [[ $TELEMETRY == "0" || $TELEMETRY == "1" ]] || die "TELEMETRY must be 0 or 1"
+  [[ $TELEMETRY_WRITE_LOG == "0" || $TELEMETRY_WRITE_LOG == "1" ]] || die "TELEMETRY_WRITE_LOG must be 0 or 1"
+  if ((TELEMETRY == 0)); then
+    ((TELEMETRY_WRITE_LOG == 0)) || die "TELEMETRY_WRITE_LOG needs TELEMETRY=1"
+    return 0
+  fi
+  # GPS history is behind this token, so a placeholder or a short one will not do.
+  [[ $TELEMETRY_TOKEN != "CHANGEME" && ${#TELEMETRY_TOKEN} -ge 16 && $TELEMETRY_TOKEN =~ ^[[:graph:]]+$ ]] || die "set TELEMETRY_TOKEN in $ENV_FILE to 16 or more characters, with no spaces"
+  [[ $TELEMETRY_PORT =~ ^[0-9]+$ && $TELEMETRY_PORT -ge 1024 && $TELEMETRY_PORT -le 65535 ]] || die "TELEMETRY_PORT must be 1024–65535"
+  [[ $TELEMETRY_BIND =~ ^[0-9A-Fa-f:.]+$ ]] || die "TELEMETRY_BIND must be an IP address"
+  [[ $TELEMETRY_POLL_SECS =~ ^[0-9]+$ && $TELEMETRY_POLL_SECS -ge 5 ]] || die "TELEMETRY_POLL_SECS must be at least 5"
+  [[ $TELEMETRY_HOLD_MS =~ ^[0-9]+$ && $TELEMETRY_HOLD_MS -ge 50 ]] || die "TELEMETRY_HOLD_MS must be at least 50"
+  [[ $TELEMETRY_KEEP_DAYS =~ ^[1-9][0-9]*$ ]] || die "TELEMETRY_KEEP_DAYS must be at least 1"
+  for name in TELEMETRY_BRAKE_MPS2 TELEMETRY_ACCEL_MPS2 TELEMETRY_CORNER_MPS2; do
+    value=${!name}
+    [[ $value =~ ^[0-9]+(\.[0-9]+)?$ && ! $value =~ ^0+(\.0+)?$ ]] || die "$name must be a number above 0"
+  done
+  [[ -z $TELEMETRY_WEBHOOK_URL || $TELEMETRY_WEBHOOK_URL == http://* || $TELEMETRY_WEBHOOK_URL == https://* ]] || die "TELEMETRY_WEBHOOK_URL must start with http:// or https://"
+  [[ $TELEMETRY_WEBHOOK_FORMAT == "json" || $TELEMETRY_WEBHOOK_FORMAT == "text" ]] || die "TELEMETRY_WEBHOOK_FORMAT must be json or text"
+  [[ $TELEMETRY_WEBHOOK_GPS == "0" || $TELEMETRY_WEBHOOK_GPS == "1" ]] || die "TELEMETRY_WEBHOOK_GPS must be 0 or 1"
 }
 
 # Fill NET_SSID, NET_PSK, NET_PRI, and NET_CON from WIFI_NET_1..8.
@@ -234,6 +273,9 @@ release_dashcam_devices() {
     done
     ((unmounted)) || return 1
   fi
+  # A telemetry scanner that was killed can leave its view open on the origin.
+  umount "$STATE_DIR/telemetry" 2>/dev/null || true
+  dmsetup remove dashcam-telem >/dev/null 2>&1 || true
   kpartx -d /dev/mapper/dashcam-origin >/dev/null 2>&1 || true
   kpartx -d /dev/mapper/dashcam-snap >/dev/null 2>&1 || true
   dmsetup remove dashcam-snap >/dev/null 2>&1 || true

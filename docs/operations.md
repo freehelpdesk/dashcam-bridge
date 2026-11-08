@@ -72,6 +72,43 @@ tesdec decrypt ~/TeslaCam-copy --output ~/TeslaCam-plain
 
 That tool lives in the sibling project `tesdec`. Its README covers sign-in. Decrypted output is the full-size video.
 
+## Telemetry and alerts
+
+With `TELEMETRY=1` the Pi reads the metadata Tesla embeds in each front-camera clip: speed, pedal, brake, steering, blinkers, Autopilot state, GPS, heading, and acceleration. It needs firmware 2025.44.25 or later on HW3 or above, and unencrypted clips. A parked car usually records no metadata.
+
+A clip has to finish before the Pi can read it, and clips are about a minute long. An alert arrives a few seconds to just over a minute after the event, and only while the Pi has power and a network. A missed alert is retried when the network comes back. Clips from a backlog are stored, but only the newest three can alert.
+
+Set `TELEMETRY_TOKEN` in `/etc/dashcam-bridge.env`, set `TELEMETRY=1`, run provision, and reboot if it says to. Send the token with every request:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://dashcam.local:8088/latest
+```
+
+| Path | What it returns |
+| --- | --- |
+| `/healthz` | `{"ok":true}`, with no token needed |
+| `/latest` | The newest stored sample |
+| `/samples?since=&limit=` | Samples at two per second, oldest first. `since` is Unix time. At most 5000 |
+| `/events?since=&type=&limit=` | Hard events, newest first. `type` is `hard_brake`, `hard_accel`, or `hard_corner` |
+| `/status` | Newest clip, row counts, pending alerts, and scanner health |
+| `/stream` | Server-sent `sample` and `alert` events. They arrive in a burst as each clip finishes |
+
+Acceleration is in m/s². `accel_long` is positive when speeding up and `accel_lat` is side to side. Detection uses every frame, and an event has to last `TELEMETRY_HOLD_MS`. Braking and acceleration also have to show up in the speed, so a pothole does not alert. In `/status`, `axis_correlation` should be near 1. A value near 0 or below means this car reports its axes differently.
+
+Times come from the car's clip names, read in the Pi's time zone. The API is plain HTTP, so the token and your location cross the network unencrypted. Use it on networks you trust, and never forward the port on a router. Alerts leave out the location unless `TELEMETRY_WEBHOOK_GPS=1`.
+
+The scanner reads a private, read-only view of the drive that the kernel will not let it write to, so it cannot disturb what the car is recording. It works the same in both `SHARE` modes.
+
+### Measure the write timing
+
+To find out whether reading the disk as the car writes could beat the one-minute delay, set `TELEMETRY_WRITE_LOG=1`, run provision, reboot, and go for a drive. The log stops after an hour of writing. Back home:
+
+```bash
+sudo python3 /usr/local/lib/dashcam-bridge/telemetry.py write-report
+```
+
+`p95_gap_s` is the key number: how long the car can go between writes. Set `TELEMETRY_WRITE_LOG=0` afterward, because logging flushes the disk every second.
+
 ## When the car sleeps
 
 A one-cable Pi loses power when the car drops the USB port. The Pi turns off. The files remain on the card. On the next wake the Pi boots, then the drive reappears. The car can complain if it looks for the drive during that boot; it settles once the gadget is back. The drive is presented early in boot, before the Pi's network and SMB share are ready, and the share follows later. To see how long the car waited:
@@ -104,6 +141,7 @@ sudo /usr/local/lib/dashcam-bridge/status.sh
 | The share refuses the connection | The drive did not mount on the Pi, or it has not finished mounting since boot. The car can still record to it. `journalctl -u dashcam-share -b` |
 | `STORAGE=nvme` or `STORAGE=usb` fails at boot | No matching disk appeared within 30 seconds, the drive is under 64 GiB, or it is a new drive that already has partitions. Those partitions are left in place. Adopt a Tesla partition with `e2label`, or set `STORAGE=sd` |
 | A file copied over USB is absent from the share | Eject that USB disk first. With `SHARE=snapshot`, disconnect, wait a minute, and connect again. With `SHARE=live`, reopen the folder after a couple of seconds |
+| Telemetry has no new data | `journalctl -u dashcam-telemetry-scan -b`. A parked car records no metadata. `encrypted_recent` above 0 in `/status` means the car may be writing encrypted clips, which the Pi cannot read |
 | A file stays in the inbox | The car is still writing, the file is still open on a computer, or it could not be written. `journalctl -u dashcam-inbox -b` |
 | Copy fails near the end and `snapshot scratch` is near 100% | The scratch area filled while the car was still writing. Disconnect, let the refresh run, copy again. Raise `COW_GB` if you copy for a long time while the car records |
 | Car asks to format on every plug | Stop the stack, delete the image, set `IMAGE_FS=exfat`, start it again (commands below). Let the car format once after that |
@@ -147,6 +185,6 @@ With `STORAGE=usb` or `STORAGE=nvme` the clips are on that disk, not in `cam.img
 
 ## Passwords and the LAN
 
-Each saved network can reach the share. Anyone on the house LAN, or on the car's Starlink, who has `SMB_PASSWORD` can read the footage and add or replace files through the inbox. With `SHARE=live` they can also delete it. Pick a real password. The access point is WPA2 with `AP_PSK`. Leave port 445 closed on every router. The share is for those networks and the access point, not for the public internet.
+Each saved network can reach the share. Anyone on the house LAN, or on the car's Starlink, who has `SMB_PASSWORD` can read the footage and add or replace files through the inbox. With `SHARE=live` they can also delete it. With `TELEMETRY=1`, anyone with `TELEMETRY_TOKEN` can read the car's location history. Pick a real password. The access point is WPA2 with `AP_PSK`. Leave port 445 closed on every router. The share is for those networks and the access point, not for the public internet.
 
 After the first provision, passwords live in `/etc/dashcam-bridge.env`. Edit that file and run `sudo ./scripts/provision.sh` again to apply a new SMB or Wi-Fi password. A reboot is required only when `config.txt` changed, and the script says so.

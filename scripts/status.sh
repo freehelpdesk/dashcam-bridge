@@ -59,6 +59,11 @@ else
   printf 'gadget: down\n'
 fi
 
+if ((TELEMETRY)); then
+  printf 'telemetry: scanner %s, api %s on port %s\n' \
+    "$(systemctl is-active dashcam-telemetry-scan.service 2>/dev/null || true)" \
+    "$(systemctl is-active dashcam-telemetry.service 2>/dev/null || true)" "$TELEMETRY_PORT"
+fi
 printf 'storage: %s\n' "$STORAGE"
 printf 'share mode: %s\n' "$SHARE"
 if [[ -f $STATE_DIR/loops ]]; then

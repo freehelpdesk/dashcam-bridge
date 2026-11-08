@@ -1,0 +1,28 @@
+[Unit]
+Description=Dashcam telemetry API and alerts
+After=network.target dashcam-telemetry-scan.service
+ConditionPathExists=/etc/dashcam-bridge-telemetry.json
+
+[Service]
+Type=simple
+User=dashcam-telemetry
+Group=dashcam-telemetry
+ExecStart=/usr/bin/python3 -I /usr/local/lib/dashcam-bridge/telemetry.py serve
+Restart=always
+RestartSec=10
+# This is the part reachable over the network, so it gets nothing else.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dashcam-telemetry
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

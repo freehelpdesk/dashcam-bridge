@@ -50,6 +50,7 @@ packages=(
   wpasupplicant iw rfkill network-manager
 )
 ((REDUCED_POWER == 0)) || packages+=(nvme-cli)
+((TELEMETRY == 0)) || packages+=(python3)
 apt-get install -y "${packages[@]}"
 
 case "$model" in
@@ -153,7 +154,7 @@ fi
 systemctl disable --now bluetooth.service >/dev/null 2>&1 || true
 
 install -d -m 755 "$LIB" /mnt/dashcam "$IMAGE_DIR" /etc/avahi/services /etc/NetworkManager/conf.d
-install -m 755 "$REPO"/scripts/*.sh "$LIB/"
+install -m 755 "$REPO"/scripts/*.sh "$REPO"/scripts/*.py "$LIB/"
 install -m 644 "$REPO"/systemd/*.service "$REPO"/systemd/*.timer /etc/systemd/system/
 install -m 644 "$REPO/config/avahi-dashcam.service" /etc/avahi/services/dashcam.service
 cat >/etc/NetworkManager/conf.d/dashcam-wifi.conf <<'EOF'
@@ -294,6 +295,29 @@ write_client_networks() {
   done
 }
 
+# The API is network-facing, so it runs as its own user and reads a config file
+# holding only its own settings, never the Wi-Fi or SMB passwords.
+setup_telemetry() {
+  local config=/etc/dashcam-bridge-telemetry.json user=dashcam-telemetry
+  if ((TELEMETRY == 0)); then
+    systemctl disable --now dashcam-write-log.service dashcam-telemetry.service dashcam-telemetry-scan.service >/dev/null 2>&1 || true
+    rm -f "$config"
+    return 0
+  fi
+  id "$user" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$user"
+  install -d -o "$user" -g "$user" -m 750 /var/lib/dashcam-telemetry
+  (
+    export "${!TELEMETRY@}"
+    python3 -I "$LIB/telemetry.py" write-config "$config" "$user"
+  )
+  systemctl enable dashcam-telemetry-scan.service dashcam-telemetry.service
+  if ((TELEMETRY_WRITE_LOG)); then
+    systemctl enable dashcam-write-log.service
+  else
+    systemctl disable --now dashcam-write-log.service >/dev/null 2>&1 || true
+  fi
+}
+
 write_ap
 write_client_networks
 nmcli connection reload
@@ -302,6 +326,7 @@ systemctl daemon-reload
 systemctl enable smbd nmbd avahi-daemon
 systemctl enable dashcam-storage.service dashcam-gadget.service dashcam-share.service dashcam-nvme-power.service
 systemctl enable dashcam-refresh.timer dashcam-wifi.timer dashcam-inbox.timer
+setup_telemetry
 systemctl restart avahi-daemon || true
 
 if systemctl is-active --quiet dashcam-storage.service || systemctl is-active --quiet dashcam-gadget.service; then
@@ -325,5 +350,8 @@ else
   systemctl restart dashcam-storage.service dashcam-gadget.service dashcam-share.service
   systemctl restart dashcam-refresh.timer dashcam-wifi.timer dashcam-inbox.timer
   systemctl start dashcam-wifi.service || true
+  if ((TELEMETRY)); then
+    systemctl restart dashcam-telemetry-scan.service dashcam-telemetry.service
+  fi
   log "already provisioned. status: sudo ${LIB}/status.sh"
 fi

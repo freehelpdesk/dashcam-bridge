@@ -1,0 +1,12 @@
+[Unit]
+Description=Log when the car's writes reach the Pi
+After=dashcam-storage.service dashcam-gadget.service
+ConditionPathExists=/etc/dashcam-bridge-telemetry.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/lib/dashcam-bridge/telemetry.py write-log
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

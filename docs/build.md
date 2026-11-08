@@ -54,6 +54,7 @@ Provision installs:
 | `iw`, `rfkill` | confirm the access point and turn Wi-Fi power save off |
 | `network-manager` | already on Raspberry Pi OS Bookworm and Trixie; listed so the dependency is explicit |
 | `nvme-cli` | sets the NVMe power limit. Installed only with `REDUCED_POWER=1` |
+| `python3` | runs the telemetry service. Installed only with `TELEMETRY=1` |
 
 Bluetooth is disabled. The Wi-Fi and Bluetooth radios share one chip, and this box only needs Wi-Fi.
 
@@ -90,6 +91,8 @@ Set these before you run it. Provision refuses the `CHANGEME` placeholders.
 | `POWER_SOURCE` | `bus` for the one-cable Pi 4. `external` when a GPIO supply powers the board |
 | `REDUCED_POWER` | `1` lowers a Pi 5's peak current by capping the CPU at 1.5 GHz, running PCIe at Gen 1, and holding an NVMe drive to its lowest-power working state. Default `0` |
 
+| `TELEMETRY`, `TELEMETRY_TOKEN`, `TELEMETRY_PORT` | `1` reads the car's data from finished clips and serves it on the port, default 8088. The token is required, 16 or more characters. Default `0`. The other `TELEMETRY_*` keys are described in `config/dashcam-bridge.env` and `docs/operations.md` |
+
 `POWER_SOURCE=external` changes the USB descriptor to self-powered. It does not move any wires. The wiring is in `docs/hardware.md`.
 
 After reboot the first start of `dashcam-storage.service` creates the drive the car sees. With `STORAGE=sd` that is a sparse `cam.img` on the boot disk, and the free-space check requires the full size so the card cannot fill up halfway through a trip. With `STORAGE=nvme` or `STORAGE=usb` the drive itself is partitioned and the car writes straight to it. The snapshot scratch file still lives on the boot disk.
@@ -102,6 +105,8 @@ After reboot the first start of `dashcam-storage.service` creates the drive the 
 | `dashcam-gadget.service` | Exports `/dev/mapper/dashcam-origin` as a USB drive on the USB-C port |
 | `dashcam-nvme-power.service` | With `REDUCED_POWER=1`, limits each NVMe drive before the car gets its drive. Otherwise does nothing |
 | `dashcam-share.service` | After the car has its drive, mounts the snapshot and the inbox, then reloads Samba |
+| `dashcam-telemetry-scan.service` | With `TELEMETRY=1`, reads each finished clip into a database. Runs after the gadget, so it never delays the car |
+| `dashcam-telemetry.service` | With `TELEMETRY=1`, serves the API and sends alerts, as an unprivileged user |
 | `dashcam-refresh.timer` | Every two seconds, drops the cache so `SHARE=live` shows new USB writes. `SHARE=snapshot` still replaces its frozen view about once a minute |
 | `dashcam-inbox.timer` | Every 15 seconds, writes settled inbox files to the drive if the car is idle |
 | `dashcam-wifi.timer` | Every two minutes, joins the best saved network that is actually on. Otherwise starts the access point, trying 5 GHz and falling back to 2.4 GHz |

@@ -1,0 +1,17 @@
+[Unit]
+Description=Dashcam telemetry scanner
+After=dashcam-storage.service dashcam-gadget.service
+ConditionPathExists=/etc/dashcam-bridge-telemetry.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/lib/dashcam-bridge/telemetry.py scan
+Restart=always
+RestartSec=10
+# The car's writes come first.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

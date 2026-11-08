@@ -11,6 +11,8 @@ if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); 
   exit 2
 fi
 
+# common.sh narrows PATH, which can hide the newer Python on a development machine.
+PYTHON=$(command -v python3 || true)
 SCRIPTS=${SCRIPTS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)}
 export DASHCAM_TEST=1
 # shellcheck source=../scripts/wifi.sh
@@ -236,6 +238,55 @@ NET_INSTALL_AT_POWER_ON=1'
     "$(printf '[all]\nBOOT_ORDER=0xf1\n[gpio8=0]\nBOOT_ORDER=0xf7\n' | eeprom_boot_tuned 3000 | lines)"
 fi
 
+# --- telemetry -------------------------------------------------------------
+
+if [[ -f $SCRIPTS/telemetry.py ]]; then
+  telemetry_value() { # extra assignments, then validate
+    (
+      TELEMETRY=1 TELEMETRY_TOKEN=abcdefghijklmnop1234 TELEMETRY_PORT=8088 TELEMETRY_BIND=0.0.0.0
+      TELEMETRY_POLL_SECS=10 TELEMETRY_BRAKE_MPS2=4 TELEMETRY_ACCEL_MPS2=4 TELEMETRY_CORNER_MPS2=4.5
+      TELEMETRY_HOLD_MS=250 TELEMETRY_KEEP_DAYS=30 TELEMETRY_WEBHOOK_URL= TELEMETRY_WEBHOOK_FORMAT=json
+      TELEMETRY_WEBHOOK_GPS=0 TELEMETRY_WRITE_LOG=0
+      for assignment in "$@"; do
+        printf -v "${assignment%%=*}" '%s' "${assignment#*=}"
+      done
+      validate_telemetry
+    ) 2>&1
+  }
+  telemetry_refused() { # expected text, then assignments
+    local want=$1 out
+    shift
+    out=$(telemetry_value "$@")
+    [[ $out == *"$want"* ]] && echo yes
+  }
+  check "good telemetry settings pass" "" "$(telemetry_value)"
+  check "telemetry off needs no token" "" "$(telemetry_value TELEMETRY=0 TELEMETRY_TOKEN=)"
+  check "placeholder token is refused" "yes" "$(telemetry_refused TELEMETRY_TOKEN TELEMETRY_TOKEN=CHANGEME)"
+  check "short token is refused" "yes" "$(telemetry_refused TELEMETRY_TOKEN TELEMETRY_TOKEN=short)"
+  check "token with a space is refused" "yes" "$(telemetry_refused TELEMETRY_TOKEN 'TELEMETRY_TOKEN=abcdefghijkl mnop1234')"
+  check "privileged port is refused" "yes" "$(telemetry_refused TELEMETRY_PORT TELEMETRY_PORT=80)"
+  check "zero threshold is refused" "yes" "$(telemetry_refused BRAKE TELEMETRY_BRAKE_MPS2=0.0)"
+  check "webhook needs http" "yes" "$(telemetry_refused WEBHOOK_URL TELEMETRY_WEBHOOK_URL=ftp://x)"
+  check "write log needs telemetry" "yes" "$(telemetry_refused 'needs TELEMETRY' TELEMETRY=0 TELEMETRY_WRITE_LOG=1)"
+
+  UNITS=$SCRIPTS/../systemd
+  check "scanner waits for the car's drive" 1 "$(grep -E '^After=' "$UNITS/dashcam-telemetry-scan.service" | grep -c dashcam-gadget)"
+  check "nothing the car needs waits for telemetry" 0 \
+    "$(grep -hE '^(After|Requires|Wants)=' "$UNITS/dashcam-storage.service" "$UNITS/dashcam-gadget.service" | grep -c telemetry)"
+  check "api is not root" 1 "$(grep -c '^User=dashcam-telemetry$' "$UNITS/dashcam-telemetry.service")"
+  check "teardown clears a leftover view" 1 "$(grep -c 'dmsetup remove dashcam-telem' "$SCRIPTS/common.sh")"
+  check "provision installs the python" 1 "$(grep -c 'scripts/\*.py' "$SCRIPTS/provision.sh")"
+
+  if [[ -n $PYTHON ]]; then
+    PY_OUTPUT=$(SCRIPTS=$SCRIPTS "$PYTHON" -I "$SCRIPTS/../tests/test_telemetry.py" 2>&1)
+    PY_RC=$?
+    check "telemetry unit tests" 0 "$PY_RC"
+    ((PY_RC == 0)) || printf '%s\n' "$PY_OUTPUT"
+  else
+    printf 'skipped the telemetry unit tests: python3 is missing\n'
+  fi
+fi
+
 # --- reduced power ---------------------------------------------------------
 
 if [[ -f $SCRIPTS/nvme-power.sh ]]; then
@@ -322,7 +373,7 @@ ps      4 : mp:0.0040W non-operational enlat:2000 exlat:40000 rrt:4 rrl:4'
     WIFI_COUNTRY=US AP_SSID=dashcam AP_PSK=password1 SMB_PASSWORD=password1 SMB_USER=dashcam
     IMAGE_GB=128 COW_GB=16 IMAGE_FS=ext4 STORAGE=sd SHARE=snapshot GADGET_NOFUA=0 POWER_SOURCE=bus
     SNAP_CHUNK=32 INBOX_GB=4 INBOX_IDLE_SECS=120 INBOX_SETTLE_SECS=60 INBOX_MAX_SECS=60
-    REDUCED_POWER=$1
+    REDUCED_POWER=$1 TELEMETRY=0 TELEMETRY_WRITE_LOG=0
     (validate_env) 2>&1
   }
   check "reduced power accepts 1" "" "$(reduced_value 1)"

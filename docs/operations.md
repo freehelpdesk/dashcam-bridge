@@ -95,7 +95,32 @@ curl -H "Authorization: Bearer $TOKEN" http://dashcam.local:8088/latest
 
 Acceleration is in m/s². `accel_long` is positive when speeding up and `accel_lat` is side to side. Detection uses every frame, and an event has to last `TELEMETRY_HOLD_MS`. Braking and acceleration also have to show up in the speed, so a pothole does not alert. In `/status`, `axis_correlation` should be near 1. A value near 0 or below means this car reports its axes differently.
 
-Times come from the car's clip names, read in the Pi's time zone. The API is plain HTTP, so the token and your location cross the network unencrypted. Use it on networks you trust, and never forward the port on a router. Alerts leave out the location unless `TELEMETRY_WEBHOOK_GPS=1`.
+Times come from the car's clip names, read in the Pi's time zone. The API is plain HTTP, so the token and your location cross the network unencrypted. Use it on networks you trust, and never forward the port on a router. Alerts leave out the location, city, and street unless `TELEMETRY_WEBHOOK_GPS=1`.
+
+### Choosing alerts
+
+Set `TELEMETRY_ALERT_<NAME>` to `off`, `log`, or `alert`. `log` stores the event and shows it on the API but never sends it. `alert` also sends it, to `TELEMETRY_ALERT_<NAME>_WEBHOOK` if that is set, or to `TELEMETRY_WEBHOOK_URL` if not. Add `TELEMETRY_ALERT_<NAME>_WEBHOOK_FORMAT=text` when one service needs a different format. Thresholds and zones are described in `config/dashcam-bridge.env`. After a change, run provision. `/status` lists each alert's mode.
+
+| `<NAME>` | Default | What it reports |
+| --- | --- | --- |
+| `HARD_BRAKE`, `HARD_ACCEL`, `HARD_CORNER` | `alert` | Sustained force above a threshold |
+| `AUTOPILOT_TAKEOVER` | `alert` | Autopilot or FSD ended alongside hard braking or a sharp steering input. It cannot tell who ended it |
+| `TRIP_SUMMARY` | `alert` | When the car is put in park: distance, time, top speed, Autopilot share, event count |
+| `SENTRY_EVENT`, `SAVED_CLIP` | `alert` | A new folder on the drive, with the reason the car recorded |
+| `RECORDING_STOPPED` | `alert` | No new clip for five minutes during a drive |
+| `POWER_TROUBLE` | `alert` | Undervoltage, throttling, or a temperature limit. Once per flag per boot. A brown-out that resets the Pi clears the flag first |
+| `IMPACT` | `off` | A very short, sharp force. Treat it as a record: a crash can cut power before the clip finishes, or leave the Pi offline, so it is not an emergency alert |
+| `SWERVE` | `off` | Steering swung both ways at speed, with side force |
+| `POTHOLE` | `off` | A vertical jolt with its GPS position. `log` builds a map through `/events?type=pothole` without any pings |
+| `LANE_NO_BLINKER` | `off` | Estimated from the heading, so some will be wrong |
+| `BLINKER_LEFT_ON` | `off` | A blinker on for 30 seconds at highway speed |
+| `SPEEDING` | `off` | Above a fixed limit, or per GPS zone. It does not know posted limits |
+| `GEOFENCE` | `off` | Arrived at or left a named place. Needs `TELEMETRY_GEOFENCE_ZONES` |
+| `UNEXPECTED_USE` | `off` | A drive starting in quiet hours, or going outside an area |
+| `STORAGE_FULL` | `off` | The drive or the snapshot scratch is nearly full |
+| `TELEMETRY_LOST` | `off` | 240 clips in a row with no SEI, or the car starting to encrypt clips |
+
+Only finished clips can alert, so these arrive after the fact. A parked car usually has no SEI, so its alerts come from new folders on the drive rather than from the car's data.
 
 The scanner reads a private, read-only view of the drive that the kernel will not let it write to, so it cannot disturb what the car is recording. It works the same in both `SHARE` modes.
 
@@ -182,6 +207,29 @@ sudo systemctl start dashcam-refresh.timer
 Stop the services before removing the file. The image is loop-mounted while they are running, and a delete in that state does not free the space.
 
 With `STORAGE=usb` or `STORAGE=nvme` the clips are on that disk, not in `cam.img`. Wiping them means partitioning the disk again. Stop the services first, then erase the partition table only if you mean to delete the footage.
+
+## Update from a Mac
+
+Once SSH works, push your working tree from the repo on your Mac:
+
+```bash
+tools/push-to-pi.sh
+```
+
+It runs the tests, copies the files to `~/dashcam-bridge` on the Pi, runs provision, and confirms storage, the USB drive, and the share came back. It sends uncommitted changes too, but not files ignored by git. It asks for the Pi's `sudo` password if one is needed, so run it from a terminal.
+
+| Option | What it does |
+| --- | --- |
+| `--sync-only` | Copies the files and restarts nothing |
+| `--reboot` | Reboots too, if provision says one is needed. Without it, the USB drive stays down until you reboot |
+| `--force` | Goes ahead even though the car is writing, which interrupts the recording |
+| `--skip-tests` | Does not run `tests/run.sh` first. The tests need `brew install bash`, and are skipped if it is missing |
+| `--dry-run` | Lists what would be sent |
+| `--host user@host` | Another Pi. `DASHCAM_PI` sets the default |
+
+The push stops if the car is writing to the drive, because provision disconnects it for a moment. Your settings are safe: they stay in `/etc/dashcam-bridge.env`, and the repo's env file is not sent to a provisioned Pi. New options are added to the end of that file as comments at their defaults, so a push never changes what is switched on. Passwords, tokens, webhooks, and SSIDs are blanked in the list of options the Pi receives. To change a setting, edit that file on the Pi and push again. The Pi needs internet access for provision's package check.
+
+The files are swapped in only after all of them arrive. The last version stays in `~/dashcam-bridge.previous`. To go back, move it into place and run `sudo ./scripts/provision.sh` from it.
 
 ## Passwords and the LAN
 

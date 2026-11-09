@@ -32,6 +32,8 @@ if [[ ! -f /etc/dashcam-bridge.env ]]; then
   log "installed /etc/dashcam-bridge.env"
 else
   load_env
+  # A push leaves the repo's env file behind, and sends this list instead.
+  merge_env_options "$REPO/config/dashcam-bridge.env.defaults" "$REPO/config/dashcam-bridge.env"
 fi
 
 if ! ip link show "$WIFI_IFACE" >/dev/null 2>&1; then

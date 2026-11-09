@@ -64,7 +64,44 @@ WRITE_LOG_KEEP = 10
 
 GEARS = {0: "park", 1: "drive", 2: "reverse", 3: "neutral"}
 AUTOPILOT = {0: "none", 1: "self_driving", 2: "autosteer", 3: "tacc"}
-LABELS = {"hard_brake": "Hard braking", "hard_accel": "Hard acceleration", "hard_corner": "Hard cornering"}
+MPS_PER_MPH = 0.44704
+METERS_PER_MILE = 1609.344
+TRIP_GAP_SECS = 600       # This long without data ends a trip, whatever the gear said.
+MAX_EVENT_JSON = 65536
+FOLDER_RETRIES = 3        # Scans to wait for a new folder's event.json.
+THROTTLE_FLAGS = {0x10000: "undervoltage", 0x20000: "frequency capped", 0x40000: "throttled", 0x80000: "temperature limit"}
+
+# name: (default mode, label). Each is off, log (stored only), or alert (stored and sent).
+ALERTS = {
+    "hard_brake": ("alert", "Hard braking"),
+    "hard_accel": ("alert", "Hard acceleration"),
+    "hard_corner": ("alert", "Hard cornering"),
+    "impact": ("off", "Possible impact"),
+    "swerve": ("off", "Swerve"),
+    "pothole": ("off", "Pothole"),
+    "autopilot_takeover": ("alert", "Autopilot takeover"),
+    "lane_no_blinker": ("off", "Lane change without blinker"),
+    "blinker_left_on": ("off", "Blinker left on"),
+    "speeding": ("off", "Speeding"),
+    "geofence": ("off", "Geofence"),
+    "unexpected_use": ("off", "Unexpected use"),
+    "trip_summary": ("alert", "Trip summary"),
+    "sentry_event": ("alert", "Sentry event"),
+    "saved_clip": ("alert", "Saved clip"),
+    "recording_stopped": ("alert", "Recording stopped"),
+    "power_trouble": ("alert", "Power trouble"),
+    "storage_full": ("off", "Storage nearly full"),
+    "telemetry_lost": ("off", "Telemetry lost"),
+}
+# Seconds in which a repeat of the same kind is the same event. 0 keeps every one.
+COOLDOWNS = {
+    "hard_brake": MERGE_SECS, "hard_accel": MERGE_SECS, "hard_corner": MERGE_SECS, "impact": 30,
+    "swerve": 5, "pothole": 3, "autopilot_takeover": 5, "lane_no_blinker": 5, "speeding": 120,
+}
+FOLDER_ALERTS = {"sentry_event": "TeslaCam/SentryClips", "saved_clip": "TeslaCam/SavedClips"}
+FOLDER_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+# Kept out of a webhook unless TELEMETRY_WEBHOOK_GPS=1.
+LOCATION_DETAIL = ("city", "street")
 
 
 def say(message):
@@ -305,12 +342,200 @@ def _merge(runs, samples):
     return merged
 
 
+def alert_mode(cfg, kind):
+    return cfg["alerts"][kind]["mode"]
+
+
+def enabled(cfg, kind):
+    return alert_mode(cfg, kind) != "off"
+
+
+def _event(kind, samples, first, last, peak, **detail):
+    start = samples[first]
+    return {
+        "type": kind,
+        "offset_start": start["offset"],
+        "offset_end": samples[last]["offset"],
+        "peak": round(peak, 3),
+        "speed_start": round(start["speed"], 3),
+        "speed_end": round(samples[last]["speed"], 3),
+        "lat": start["lat"],
+        "lon": start["lon"],
+        "heading": start["heading"],
+        "detail": detail,
+    }
+
+
+def distance_m(lat1, lon1, lat2, lon2):
+    a1, a2 = math.radians(lat1), math.radians(lat2)
+    da, db = a2 - a1, math.radians(lon2 - lon1)
+    h = math.sin(da / 2) ** 2 + math.cos(a1) * math.cos(a2) * math.sin(db / 2) ** 2
+    return 6371000 * 2 * math.asin(min(1.0, math.sqrt(h)))
+
+
+def has_gps(sample):
+    return bool(sample["lat"] or sample["lon"])
+
+
+def speed_limit_mps(sample, cfg):
+    """The smallest matching zone wins, so a school zone can sit inside a town."""
+    match = None
+    if has_gps(sample):
+        for zone in cfg["speeding_zones"]:
+            if distance_m(sample["lat"], sample["lon"], zone["lat"], zone["lon"]) <= zone["radius"]:
+                if match is None or zone["radius"] < match["radius"]:
+                    match = zone
+    mph = match["mph"] if match else cfg["speeding_mph"]
+    return mph * MPS_PER_MPH if mph > 0 else None
+
+
+def detect_speeding(samples, hz, cfg):
+    step = max(1, round(hz))
+    points = list(range(0, len(samples), step))
+    events = []
+    first = None
+    for at, index in enumerate(points + [None]):
+        limit = None if index is None else speed_limit_mps(samples[index], cfg)
+        over = limit is not None and samples[index]["speed"] > limit
+        if over and first is None:
+            first = at
+            limit_at_start = limit
+        elif not over and first is not None:
+            start, end = points[first], points[at - 1]
+            if samples[end]["offset"] - samples[start]["offset"] >= cfg["speeding_secs"]:
+                top = max(s["speed"] for s in samples[start:end + 1])
+                events.append(_event("speeding", samples, start, end, top,
+                                     limit_mph=round(limit_at_start / MPS_PER_MPH, 1),
+                                     top_mph=round(top / MPS_PER_MPH, 1)))
+            first = None
+    return events
+
+
+def detect_swerve(samples, hz, cfg):
+    window = max(2, round(hz * 1.5))
+    step = max(1, round(hz / 4))
+    min_speed = cfg["swerve_min_mph"] * MPS_PER_MPH
+    swing = cfg["swerve_steer_deg"]
+    events = []
+    i = 0
+    while i + window < len(samples):
+        part = samples[i:i + window]
+        if part[0]["speed"] >= min_speed:
+            angles = [s["steering"] for s in part]
+            high, low, base = max(angles), min(angles), angles[0]
+            force = max(abs(s["accel_lat"]) for s in part)
+            # Going both ways from where it started is what separates this from a turn.
+            if high - low >= swing and high - base >= swing / 4 and base - low >= swing / 4 and force >= cfg["swerve_mps2"]:
+                events.append(_event("swerve", samples, i, i + window - 1, force, steer_swing=round(high - low, 1)))
+                i += round(hz * 3)
+                continue
+        i += step
+    return events
+
+
+def detect_takeover(samples, hz, cfg):
+    reach = max(1, round(cfg["takeover_window_secs"] * hz))
+    gap = max(1, round(hz / 10))  # Over 0.1 s, because the frame-to-frame rate is noisy.
+    events = []
+    for i in range(1, len(samples)):
+        if not samples[i - 1]["autopilot"] or samples[i]["autopilot"] or samples[i]["speed"] < MIN_SPEED_MPS:
+            continue
+        low, high = max(0, i - reach), min(len(samples), i + reach)
+        part = samples[low:high]
+        brake = max(-s["accel_long"] for s in part)
+        turn = max((abs(part[j + gap]["steering"] - part[j]["steering"]) * hz / gap for j in range(len(part) - gap)), default=0.0)
+        causes = []
+        if brake >= cfg["takeover_brake_mps2"]:
+            causes.append("braking")
+        if turn >= cfg["takeover_steer_dps"]:
+            causes.append("steering")
+        if causes:
+            events.append(_event("autopilot_takeover", samples, i, i, max(brake, 0.0),
+                                 mode=AUTOPILOT.get(samples[i - 1]["autopilot"], "unknown"),
+                                 cause=" and ".join(causes), steer_rate=round(turn)))
+    return events
+
+
+def detect_lane_change(samples, hz, cfg):
+    """Sideways travel with the heading back where it began, and no blinker."""
+    step = max(1, round(hz / 4))
+    points = samples[::step]
+    dt = step / hz
+    window = int(6 / dt)
+    min_speed = cfg["lane_min_mph"] * MPS_PER_MPH
+    events = []
+    i = 0
+    while i < len(points) - window:
+        if points[i]["speed"] < min_speed or points[i]["autopilot"]:
+            i += 1
+            continue
+        heading = points[i]["heading"]
+        offset = largest = 0.0
+        hit = None
+        for j in range(i + 1, i + window):
+            turned = (points[j]["heading"] - heading + 540) % 360 - 180
+            offset += points[j]["speed"] * math.sin(math.radians(turned)) * dt
+            largest = max(largest, abs(turned))
+            if j - i >= 8 and abs(turned) < 1.0 and largest >= 1.5 and 2.5 <= abs(offset) <= 5.5:
+                hit = j
+                break
+        if hit is None:
+            i += 1
+            continue
+        lookback = points[max(0, i - int(3 / dt)):hit + 1]
+        if not any(p["blinker_left"] or p["blinker_right"] for p in lookback):
+            events.append(_event("lane_no_blinker", samples, i * step, hit * step, abs(offset), offset_m=round(abs(offset), 1)))
+        i = hit + int(5 / dt)
+    return events
+
+
+def detect_spikes(samples, values, threshold, frames, min_speed):
+    """Short jolts. These last a few frames, so the usual hold time would miss them."""
+    events = []
+    run = 0
+    for i, value in enumerate(values):
+        if value >= threshold and samples[i]["speed"] >= min_speed:
+            run += 1
+            if run == frames:
+                last = i
+                while last + 1 < len(values) and values[last + 1] >= threshold:
+                    last += 1
+                events.append((i - frames + 1, last))
+        else:
+            run = 0
+    return [(first, last, max(values[first:last + 1])) for first, last in events]
+
+
 def detect_events(clip, cfg):
-    """Find hard braking, acceleration, and cornering in one clip."""
+    """Find every per-clip event that is switched on."""
     samples = clip["samples"]
     if len(samples) < 2 or clip["duration"] <= 0:
         return []
     hz = len(samples) / clip["duration"]
+    events = _detect_force(samples, hz, cfg)
+    if enabled(cfg, "pothole"):
+        for first, last, peak in detect_spikes(samples, [abs(s["accel_z"]) for s in samples], cfg["pothole_mps2"], 1, 5.0):
+            events.append(_event("pothole", samples, first, last, peak))
+    if enabled(cfg, "impact"):
+        values = [math.hypot(s["accel_long"], s["accel_lat"]) for s in samples]
+        after = round(5 * hz)
+        for first, last, peak in detect_spikes(samples, values, cfg["impact_mps2"], 2, 0.0):
+            stopped = min(s["speed"] for s in samples[last:last + after + 1]) < 1.0
+            events.append(_event("impact", samples, first, last, peak, stopped=stopped))
+    if enabled(cfg, "swerve"):
+        events += detect_swerve(samples, hz, cfg)
+    if enabled(cfg, "autopilot_takeover"):
+        events += detect_takeover(samples, hz, cfg)
+    if enabled(cfg, "lane_no_blinker"):
+        events += detect_lane_change(samples, hz, cfg)
+    if enabled(cfg, "speeding"):
+        events += detect_speeding(samples, hz, cfg)
+    events.sort(key=lambda event: event["offset_start"])
+    return events
+
+
+def _detect_force(samples, hz, cfg):
+    """Sustained hard braking, acceleration, and cornering."""
     window = max(1, round(SMOOTH_SECS * hz))
     hold = cfg["hold_ms"] / 1000
     long_axis = smooth([s["accel_long"] for s in samples], window)
@@ -322,6 +547,8 @@ def detect_events(clip, cfg):
     )
     events = []
     for kind, values, threshold, direction in checks:
+        if not enabled(cfg, kind):
+            continue
         for first, last in _merge(_runs(values, samples, threshold, hold), samples):
             peak = max(values[first:last + 1])
             if direction:
@@ -331,19 +558,7 @@ def detect_events(clip, cfg):
                 mean = sum(values[first:last + 1]) / (last - first + 1)
                 if change < MIN_DV_FRACTION * mean * span:
                     continue
-            start = samples[first]
-            events.append({
-                "type": kind,
-                "offset_start": start["offset"],
-                "offset_end": samples[last]["offset"],
-                "peak": round(peak, 3),
-                "speed_start": round(start["speed"], 3),
-                "speed_end": round(samples[last]["speed"], 3),
-                "lat": start["lat"],
-                "lon": start["lon"],
-                "heading": start["heading"],
-            })
-    events.sort(key=lambda event: event["offset_start"])
+            events.append(_event(kind, samples, first, last, peak))
     return events
 
 
@@ -388,7 +603,7 @@ CREATE INDEX IF NOT EXISTS samples_t ON samples (t);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY, type TEXT, start_t REAL, end_t REAL, peak REAL,
   speed_start REAL, speed_end REAL, lat REAL, lon REAL, heading REAL, clip TEXT, offset_s REAL,
-  alert_state TEXT, alert_attempts INTEGER DEFAULT 0, alert_next_at REAL DEFAULT 0);
+  alert_state TEXT, alert_attempts INTEGER DEFAULT 0, alert_next_at REAL DEFAULT 0, detail TEXT);
 CREATE INDEX IF NOT EXISTS events_t ON events (start_t);
 CREATE INDEX IF NOT EXISTS events_alert ON events (alert_state);
 """
@@ -437,6 +652,166 @@ def _stored_rows(name, start, samples):
         )
 
 
+def alert_target(kind, cfg):
+    """An alert's own webhook, or the default one."""
+    setting = cfg["alerts"].get(kind, {})
+    return setting.get("webhook") or cfg.get("webhook_url", ""), setting.get("format") or cfg.get("webhook_format", "json")
+
+
+def record_event(conn, cfg, event, name, alert):
+    """Insert one event, unless it repeats a recent one. Call inside a transaction."""
+    kind = event["type"]
+    cooldown = COOLDOWNS.get(kind, 0)
+    if cooldown:
+        prior = conn.execute("SELECT 1 FROM events WHERE type = ? AND end_t >= ? LIMIT 1",
+                             (kind, event["begin"] - cooldown)).fetchone()
+        if prior:
+            return False
+    state = "pending" if alert and alert_mode(cfg, kind) == "alert" and alert_target(kind, cfg)[0] else "none"
+    round_or_none = lambda value, places: None if value is None else round(value, places)
+    conn.execute(
+        "INSERT INTO events (type, start_t, end_t, peak, speed_start, speed_end, lat, lon, heading,"
+        " clip, offset_s, alert_state, detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (kind, round(event["begin"], 3), round(event["end"], 3), event.get("peak"), event.get("speed_start"),
+         event.get("speed_end"), round_or_none(event.get("lat"), 7), round_or_none(event.get("lon"), 7),
+         round_or_none(event.get("heading"), 2), name, round_or_none(event.get("offset_start"), 3), state,
+         json.dumps(event.get("detail") or {})),
+    )
+    return True
+
+
+def _state_event(kind, when, sample=None, peak=None, **detail):
+    event = {"type": kind, "begin": when, "end": when, "peak": peak, "detail": detail}
+    if sample:
+        event.update(speed_start=round(sample["speed"], 3), speed_end=round(sample["speed"], 3),
+                     lat=sample["lat"], lon=sample["lon"], heading=sample["heading"])
+    return event
+
+
+def close_trip(conn, trip, cfg, sample=None):
+    miles = trip["meters"] / METERS_PER_MILE
+    if miles < cfg["trip_min_miles"] or not enabled(cfg, "trip_summary"):
+        return None
+    rows = conn.execute(
+        "SELECT type, count(*) AS n FROM events WHERE start_t BETWEEN ? AND ? AND type NOT IN"
+        " ('trip_summary', 'geofence') GROUP BY type", (trip["start"], trip["last"])).fetchall()
+    seconds = trip["last"] - trip["start"]
+    event = _state_event(
+        "trip_summary", trip["start"], sample, peak=round(trip["top"], 3),
+        miles=round(miles, 1), minutes=round(seconds / 60, 1), top_mph=round(trip["top"] / MPS_PER_MPH, 1),
+        avg_mph=round(trip["meters"] / seconds / MPS_PER_MPH, 1) if seconds > 0 else 0.0,
+        autopilot_pct=round(100 * trip["autopilot"] / trip["counted"]) if trip["counted"] else 0,
+        events={row["type"]: row["n"] for row in rows})
+    event["end"] = trip["last"]
+    return event
+
+
+def in_quiet_hours(when, text):
+    if not text:
+        return False
+    first, last = (int(part) for part in text.split("-"))
+    hour = time.localtime(when).tm_hour
+    return first <= hour < last if first <= last else hour >= first or hour < last
+
+
+def _open_trip(when):
+    return {"start": when, "last": when, "meters": 0.0, "top": 0.0, "autopilot": 0.0, "counted": 0.0, "outside": False}
+
+
+def _track_blinker(state, sample, when, cfg, out):
+    side = "left" if sample["blinker_left"] else "right" if sample["blinker_right"] else None
+    fast = sample["speed"] >= cfg["blinker_min_mph"] * MPS_PER_MPH
+    held = state.get("blinker")
+    if held and (when - held["last"] > 3 or (side and side != held["side"])):
+        held = None
+    if side and fast:
+        held = held or {"side": side, "start": when, "last": when, "sent": False}
+        held["last"] = when
+        if not held["sent"] and when - held["start"] >= cfg["blinker_secs"] and enabled(cfg, "blinker_left_on"):
+            held["sent"] = True
+            out.append(_state_event("blinker_left_on", held["start"], sample, side=side,
+                                    seconds=round(when - held["start"])))
+    state["blinker"] = held
+
+
+def _track_zones(state, sample, when, cfg, out):
+    known = state.setdefault("zones", {})
+    for zone in cfg["geofence_zones"]:
+        away = distance_m(sample["lat"], sample["lon"], zone["lat"], zone["lon"])
+        was = known.get(zone["name"])
+        # A margin on the way out, so GPS drift at the edge cannot flap.
+        now = away <= zone["radius"] if was is not True else away <= zone["radius"] * 1.15 + 25
+        known[zone["name"]] = now
+        if was is not None and was != now:
+            out.append(_state_event("geofence", when, sample, zone=zone["name"], action="arrived" if now else "left"))
+
+
+def _track_use(trip, sample, when, cfg, out, opened):
+    if opened and in_quiet_hours(when, cfg["unexpected_hours"]):
+        out.append(_state_event("unexpected_use", when, sample, reason="quiet hours"))
+    area = cfg["unexpected_area"]
+    if area and not trip["outside"] and has_gps(sample):
+        if distance_m(sample["lat"], sample["lon"], area["lat"], area["lon"]) > area["radius"]:
+            trip["outside"] = True
+            out.append(_state_event("unexpected_use", when, sample, reason="outside the allowed area"))
+
+
+def track_state(conn, state, start, clip, cfg):
+    """Everything that spans clips: trips, zones, a blinker left on, and missing SEI."""
+    out = []
+    samples = clip["samples"]
+    if not samples:
+        if state.get("trip"):
+            event = close_trip(conn, state.pop("trip"), cfg)
+            if event:
+                out.append(event)
+        state["no_sei"] = state.get("no_sei", 0) + 1
+        if state["no_sei"] >= cfg["sei_lost_clips"] and not state.get("sei_alerted") and enabled(cfg, "telemetry_lost"):
+            state["sei_alerted"] = True
+            out.append(_state_event("telemetry_lost", start, reason=f"{state['no_sei']} clips in a row have no SEI"))
+        return out
+    state["no_sei"] = 0
+    state["sei_alerted"] = False
+    next_at = 0.0
+    for sample in samples:
+        if sample["offset"] < next_at:
+            continue
+        next_at = sample["offset"] + 1 / STORE_HZ
+        when = start + sample["offset"]
+        trip = state.get("trip")
+        if trip and when - trip["last"] > TRIP_GAP_SECS:
+            event = close_trip(conn, state.pop("trip"), cfg)
+            if event:
+                out.append(event)
+            trip = None
+        opened = False
+        if not trip and sample["gear"] != 0 and sample["speed"] >= MIN_SPEED_MPS:
+            trip = state["trip"] = _open_trip(when)
+            opened = True
+        if trip:
+            step = min(max(when - trip["last"], 0.0), 2.0)
+            trip["last"] = when
+            trip["meters"] += sample["speed"] * step
+            trip["top"] = max(trip["top"], sample["speed"])
+            trip["counted"] += step
+            if sample["autopilot"]:
+                trip["autopilot"] += step
+            if enabled(cfg, "unexpected_use"):
+                _track_use(trip, sample, when, cfg, out, opened)
+            if sample["gear"] == 0 and sample["speed"] < 0.5:
+                event = close_trip(conn, state.pop("trip"), cfg, sample)
+                if event:
+                    out.append(event)
+        _track_blinker(state, sample, when, cfg, out)
+        if enabled(cfg, "geofence") and has_gps(sample):
+            _track_zones(state, sample, when, cfg, out)
+    return out
+
+
+def load_state(conn):
+    return json.loads(meta_get(conn, "state") or "{}")
+
+
 def store_clip(conn, name, clip, cfg, alert):
     """Store one clip and move the watermark, all or nothing. Returns the new events."""
     start = clip_start(name)
@@ -455,23 +830,16 @@ def store_clip(conn, name, clip, cfg, alert):
             _stored_rows(name, start, samples),
         )
         for event in detect_events(clip, cfg):
-            begin = start + event["offset_start"]
-            # An event can straddle two clips.
-            prior = conn.execute(
-                "SELECT 1 FROM events WHERE type = ? AND end_t >= ? LIMIT 1",
-                (event["type"], begin - MERGE_SECS),
-            ).fetchone()
-            if prior:
-                continue
-            state = "pending" if alert and cfg.get("webhook_url") else "none"
-            conn.execute(
-                "INSERT INTO events (type, start_t, end_t, peak, speed_start, speed_end, lat, lon, heading,"
-                " clip, offset_s, alert_state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (event["type"], round(begin, 3), round(start + event["offset_end"], 3), event["peak"],
-                 event["speed_start"], event["speed_end"], round(event["lat"], 7), round(event["lon"], 7),
-                 round(event["heading"], 2), name, round(event["offset_start"], 3), state),
-            )
-            added.append(event)
+            event["begin"] = start + event["offset_start"]
+            event["end"] = start + event["offset_end"]
+            if record_event(conn, cfg, event, name, alert):
+                added.append(event)
+        # After the per-clip events, because a trip summary counts them.
+        state = load_state(conn)
+        for event in track_state(conn, state, start, clip, cfg):
+            if alert_mode(cfg, event["type"]) != "off" and record_event(conn, cfg, event, name, alert):
+                added.append(event)
+        meta_set(conn, "state", json.dumps(state))
         meta_set(conn, "watermark", name)
         if corr is not None:
             meta_set(conn, "axis_corr", corr)
@@ -597,6 +965,54 @@ def list_front_clips(root):
     return sorted(name for name in names if FRONT_CLIP.match(name))
 
 
+def read_event_json(path):
+    try:
+        with open(path, "rb") as handle:
+            return json.loads(handle.read(MAX_EVENT_JSON))
+    except (OSError, ValueError):
+        return None
+
+
+def folder_time(name):
+    return datetime.datetime.strptime(name, "%Y-%m-%d_%H-%M-%S").timestamp()
+
+
+def read_throttled():
+    """The sticky flags since boot, or None on a board without vcgencmd."""
+    try:
+        return int(run("vcgencmd", "get_throttled").stdout.strip().split("=")[1], 16) & 0xF0000
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def read_boot_id():
+    with open("/proc/sys/kernel/random/boot_id") as handle:
+        return handle.read().strip()
+
+
+def read_scratch_percent():
+    """How full the snapshot scratch is, or None in live mode."""
+    try:
+        fields = run("dmsetup", "status", "dashcam-snap").stdout.split()
+        used, total = fields[3].split("/")
+        return 100 * int(used) // int(total)
+    except (OSError, ValueError, IndexError, ZeroDivisionError, subprocess.SubprocessError):
+        return None
+
+
+def drive_percent(root):
+    stats = os.statvfs(root)
+    return 100 * (stats.f_blocks - stats.f_bavail) // stats.f_blocks if stats.f_blocks else 0
+
+
+def gadget_state():
+    states = []
+    for path in glob.glob("/sys/class/udc/*/state"):
+        with contextlib.suppress(OSError), open(path) as handle:
+            states.append(handle.read().strip())
+    return ",".join(states) or "none"
+
+
 def count_encrypted(root):
     try:
         return len(os.listdir(os.path.join(root, ENCRYPTED_DIR)))
@@ -606,7 +1022,8 @@ def count_encrypted(root):
 
 class Scanner:
     def __init__(self, conn, cfg, view=drive_view, lock=locked, exists=origin_exists,
-                 sectors=flush_and_read_sectors):
+                 sectors=flush_and_read_sectors, throttled=read_throttled, boot_id=read_boot_id,
+                 scratch=read_scratch_percent, clock=time.monotonic, gadget=gadget_state):
         self.conn = conn
         self.cfg = cfg
         self.view = view
@@ -617,6 +1034,14 @@ class Scanner:
         self.retry = False
         self.attempts = {}
         self.stored = 0
+        self.folder_tries = {}
+        self.throttled = throttled
+        self.boot_id = boot_id
+        self.scratch = scratch
+        self.clock = clock
+        self.gadget = gadget
+        self.last_clip_at = clock()
+        self.recording_sent = False
 
     def tick(self):
         """One pass. True means there is more to do right away."""
@@ -654,16 +1079,117 @@ class Scanner:
             self.attempts.pop(name, None)
             alert = not first_run and index >= len(new) - ALERT_NEWEST
             for event in store_clip(self.conn, name, clip, self.cfg, alert):
-                say(f"{event['type']} {event['peak']:.1f} m/s2 in {name}")
+                say(f"{event['type']} in {name}")
             self.stored += 1
+            self.last_clip_at = self.clock()
+            self.recording_sent = False
             if self.stored % 60 == 0:
                 prune(self.conn, self.cfg["keep_days"])
+        if not first_run:
+            self.scan_folders(root)
+            self.check_full("drive", drive_percent(root), self.cfg["drive_full_pct"])
+            self.check_encrypted(count_encrypted(root))
         with self.conn:
             meta_set(self.conn, "last_scan_at", time.time())
             meta_set(self.conn, "encrypted_recent", count_encrypted(root))
         backlog = not self.retry and len(new) > len(batch)
         self.retry = self.retry or backlog  # The rest needs no new writes to be read.
         return backlog
+
+    def notify(self, kind, when=None, event=None, **detail):
+        record = event or _state_event(kind, when if when is not None else time.time(), **detail)
+        with self.conn:
+            if record_event(self.conn, self.cfg, record, record.get("clip", ""), True):
+                say(f"{kind}: {json.dumps(detail)[:200]}")
+
+    def scan_folders(self, root):
+        for kind, folder in FOLDER_ALERTS.items():
+            key = f"folder_{kind}"
+            try:
+                names = sorted(n for n in os.listdir(os.path.join(root, folder)) if FOLDER_NAME.match(n))
+            except OSError:
+                continue
+            mark = meta_get(self.conn, key)
+            if mark is None:
+                # What is already on the drive is not news.
+                with self.conn:
+                    meta_set(self.conn, key, names[-1] if names else "")
+                continue
+            for name in (n for n in names if n > mark):
+                info = read_event_json(os.path.join(root, folder, name, "event.json"))
+                if info is None:
+                    # The car writes event.json after creating the folder.
+                    self.folder_tries[name] = self.folder_tries.get(name, 0) + 1
+                    if self.folder_tries[name] < FOLDER_RETRIES:
+                        self.retry = True
+                        break
+                self.folder_tries.pop(name, None)
+                info = info if isinstance(info, dict) else {}
+                if enabled(self.cfg, kind):
+                    event = _state_event(kind, folder_time(name), folder=name, reason=str(info.get("reason", "unknown")),
+                                         camera=str(info.get("camera", "")), city=str(info.get("city", "")),
+                                         street=str(info.get("street", "")))
+                    with contextlib.suppress(KeyError, TypeError, ValueError):
+                        event.update(lat=float(info["est_lat"]), lon=float(info["est_lon"]))
+                    self.notify(kind, event=event, folder=name)
+                with self.conn:
+                    meta_set(self.conn, key, name)
+
+    def check_full(self, which, percent, limit):
+        """Once per crossing. It has to fall 2 points below the limit to alert again."""
+        if not enabled(self.cfg, "storage_full"):
+            return
+        key = f"full_{which}"
+        sent = meta_get(self.conn, key) == "1"
+        if percent >= limit and not sent:
+            self.notify("storage_full", which=which, percent=percent)
+            with self.conn:
+                meta_set(self.conn, key, 1)
+        elif sent and percent < limit - 2:
+            with self.conn:
+                meta_set(self.conn, key, 0)
+
+    def check_encrypted(self, count):
+        previous = meta_get(self.conn, "encrypted_recent")
+        if previous is None or count <= int(previous) or not enabled(self.cfg, "telemetry_lost"):
+            return
+        state = load_state(self.conn)
+        if not state.get("sei_alerted"):
+            state["sei_alerted"] = True
+            with self.conn:
+                meta_set(self.conn, "state", json.dumps(state))
+            self.notify("telemetry_lost", reason="the car is writing encrypted clips")
+
+    def health(self):
+        """Checks that do not depend on the drive changing."""
+        if enabled(self.cfg, "power_trouble"):
+            self.check_power()
+        if enabled(self.cfg, "recording_stopped"):
+            self.check_recording()
+        scratch = self.scratch()
+        if scratch is not None:
+            self.check_full("scratch", scratch, self.cfg["scratch_full_pct"])
+
+    def check_power(self):
+        flags = self.throttled()
+        if flags is None:
+            return
+        boot = self.boot_id()
+        stored = (meta_get(self.conn, "power_seen") or ":0").split(":")
+        seen = int(stored[1]) if stored[0] == boot else 0
+        new = flags & ~seen
+        if new:
+            names = [label for bit, label in THROTTLE_FLAGS.items() if new & bit]
+            self.notify("power_trouble", flags=names, raw=hex(flags))
+            with self.conn:
+                meta_set(self.conn, "power_seen", f"{boot}:{seen | flags}")
+
+    def check_recording(self):
+        waited = self.clock() - self.last_clip_at
+        if self.recording_sent or waited < self.cfg["recording_stopped_secs"] or not load_state(self.conn).get("trip"):
+            return
+        self.recording_sent = True
+        self.notify("recording_stopped", minutes=round(waited / 60, 1), usb=self.gadget())
 
     @staticmethod
     def read(root, name):
@@ -680,10 +1206,18 @@ def row_dict(row):
     return {key: row[key] for key in row.keys()}
 
 
+def event_detail(event):
+    detail = event.get("detail")
+    if isinstance(detail, str):
+        return json.loads(detail or "{}")
+    return detail or {}
+
+
 def event_public(row):
     event = row_dict(row)
     for key in ("alert_attempts", "alert_next_at"):
         event.pop(key, None)
+    event["detail"] = event_detail(event)
     return event
 
 
@@ -707,7 +1241,7 @@ def fetch_events(conn, query):
     return [event_public(row) for row in rows]
 
 
-def fetch_status(conn):
+def fetch_status(conn, cfg):
     clip = conn.execute("SELECT * FROM clips WHERE status = 'parsed' ORDER BY name DESC LIMIT 1").fetchone()
     counts = {
         table: conn.execute(f"SELECT count(*) AS n FROM {table}").fetchone()["n"]
@@ -721,6 +1255,8 @@ def fetch_status(conn):
         "last_scan_at": float(last_scan) if last_scan else None,
         "axis_correlation": float(corr) if corr else None,
         "encrypted_recent": int(meta_get(conn, "encrypted_recent") or 0),
+        # Whether a webhook is set, never the URL, which can hold a secret.
+        "alerts": {kind: {"mode": alert_mode(cfg, kind), "webhook": bool(alert_target(kind, cfg)[0])} for kind in ALERTS},
         "pending_alerts": conn.execute(
             "SELECT count(*) AS n FROM events WHERE alert_state = 'pending'").fetchone()["n"],
         **counts,
@@ -763,7 +1299,7 @@ class Api(BaseHTTPRequestHandler):
             "/latest": self.latest,
             "/samples": lambda conn: self.reply(200, fetch_samples(conn, query)),
             "/events": lambda conn: self.reply(200, fetch_events(conn, query)),
-            "/status": lambda conn: self.reply(200, fetch_status(conn)),
+            "/status": lambda conn: self.reply(200, fetch_status(conn, self.server.cfg)),
             "/stream": self.stream,
         }
         route = routes.get(url.path)
@@ -825,29 +1361,69 @@ class Api(BaseHTTPRequestHandler):
             self.server.streams.release()
 
 
+def _speed_text(mps):
+    return f"{mps / MPS_PER_MPH:.0f} mph ({mps * 3.6:.0f} km/h)"
+
+
+def _force_text(event):
+    return f"{event['peak']:.1f} m/s\u00b2 ({event['peak'] / 9.80665:.2f} g), {_speed_text(event['speed_start'] or 0)}"
+
+
+def _reason_text(detail):
+    return detail.get("reason", "unknown").replace("_", " ")
+
+
+MESSAGES = {
+    "hard_brake": _force_text,
+    "hard_accel": _force_text,
+    "hard_corner": _force_text,
+    "swerve": _force_text,
+    "impact": lambda e: _force_text(e) + (", then stopped" if event_detail(e).get("stopped") else ""),
+    "pothole": lambda e: f"{e['peak']:.1f} m/s\u00b2 at {_speed_text(e['speed_start'] or 0)}",
+    "autopilot_takeover": lambda e: f"{event_detail(e)['mode'].replace('_', ' ')} ended with {event_detail(e)['cause']}, {_speed_text(e['speed_start'] or 0)}",
+    "lane_no_blinker": lambda e: f"about {event_detail(e)['offset_m']} m sideways at {_speed_text(e['speed_start'] or 0)}",
+    "blinker_left_on": lambda e: f"{event_detail(e)['side']} blinker on for {event_detail(e)['seconds']} s",
+    "speeding": lambda e: f"{event_detail(e)['top_mph']:.0f} mph in a {event_detail(e)['limit_mph']:.0f} mph limit",
+    "geofence": lambda e: f"{event_detail(e)['action']} {event_detail(e)['zone']}",
+    "unexpected_use": lambda e: f"driving during {event_detail(e)['reason']}" if event_detail(e)["reason"] == "quiet hours" else event_detail(e)["reason"],
+    "trip_summary": lambda e: (lambda d: f"{d['miles']} mi in {d['minutes']:.0f} min, top {d['top_mph']:.0f} mph, "
+                                         f"{d['autopilot_pct']}% Autopilot, {sum(d['events'].values())} events")(event_detail(e)),
+    "sentry_event": lambda e: _reason_text(event_detail(e)),
+    "saved_clip": lambda e: _reason_text(event_detail(e)),
+    "recording_stopped": lambda e: f"no new clip for {event_detail(e)['minutes']} min during a drive, USB {event_detail(e)['usb']}",
+    "power_trouble": lambda e: ", ".join(event_detail(e)["flags"]),
+    "storage_full": lambda e: f"{event_detail(e)['which']} is {event_detail(e)['percent']}% full",
+    "telemetry_lost": lambda e: event_detail(e)["reason"],
+}
+
+
 def event_message(event):
-    label = LABELS.get(event["type"], event["type"])
+    kind = event["type"]
+    label = ALERTS.get(kind, (None, kind))[1]
     moment = time.strftime("%H:%M:%S", time.localtime(event["start_t"]))
-    mph = event["speed_start"] * 2.23694
-    kmh = event["speed_start"] * 3.6
-    return f"{label}: {event['peak']:.1f} m/s² ({event['peak'] / 9.80665:.2f} g) at {moment}, {mph:.0f} mph ({kmh:.0f} km/h)"
+    return f"{label} at {moment}: {MESSAGES[kind](event)}"
 
 
 def alert_request(event, cfg):
-    """Third-party services see only what is here, so GPS stays out unless asked for."""
+    """Third-party services see only what is here, so location stays out unless asked for."""
     message = event_message(event)
-    if cfg["webhook_format"] == "text":
+    if alert_target(event["type"], cfg)[1] == "text":
         return message.encode(), "text/plain; charset=utf-8"
     detail = {key: event[key] for key in ("type", "start_t", "end_t", "peak", "speed_start", "speed_end", "clip", "offset_s")}
+    extra = dict(event_detail(event))
     if cfg["webhook_gps"]:
         detail.update(lat=event["lat"], lon=event["lon"], heading=event["heading"])
+    else:
+        for key in LOCATION_DETAIL:
+            extra.pop(key, None)
+    detail["detail"] = extra
     body = {"content": message, "text": message, "message": message, "event": detail}
     return json.dumps(body).encode(), "application/json"
 
 
 def post_alert(event, cfg):
     data, content_type = alert_request(event, cfg)
-    request = urllib.request.Request(cfg["webhook_url"], data=data, headers={"Content-Type": content_type}, method="POST")
+    request = urllib.request.Request(alert_target(event["type"], cfg)[0], data=data, headers={"Content-Type": content_type}, method="POST")
     with urllib.request.urlopen(request, timeout=10) as response:
         response.read(1024)
 
@@ -858,8 +1434,16 @@ def send_alerts(conn, cfg, post=post_alert, now=time.time):
         "SELECT * FROM events WHERE alert_state = 'pending' AND alert_next_at <= ? ORDER BY start_t LIMIT 10",
         (now(),),
     ).fetchall()
+    down = set()
     for row in rows:
         event = row_dict(row)
+        url = alert_target(event["type"], cfg)[0]
+        if url in down:
+            continue  # One dead webhook must not hold up the others.
+        if not url:
+            with conn:
+                conn.execute("UPDATE events SET alert_state = 'none' WHERE id = ?", (event["id"],))
+            continue
         try:
             post(event, cfg)
         except Exception as error:  # pylint: disable=broad-except
@@ -873,7 +1457,8 @@ def send_alerts(conn, cfg, post=post_alert, now=time.time):
                 )
             # The URL can hold a secret, so only the kind of failure is logged.
             say(f"alert {event['id']} not sent yet ({type(error).__name__})")
-            return
+            down.add(url)
+            continue
         with conn:
             conn.execute("UPDATE events SET alert_state = 'sent' WHERE id = ?", (event["id"],))
 
@@ -989,20 +1574,80 @@ def write_report_main(directory=DATA_DIR):
 # --- commands --------------------------------------------------------------
 
 
+def parse_zones(text, with_limit=False):
+    """name:lat,lon:radius_m, separated by ;  Speeding zones add :mph."""
+    zones = []
+    for item in filter(None, (part.strip() for part in text.split(";"))):
+        parts = item.split(":")
+        if len(parts) != (4 if with_limit else 3):
+            raise ValueError(f"bad zone: {item}")
+        lat, lon = (float(value) for value in parts[1].split(","))
+        zone = {"name": parts[0], "lat": lat, "lon": lon, "radius": float(parts[2])}
+        if with_limit:
+            zone["mph"] = float(parts[3])
+        zones.append(zone)
+    return zones
+
+
+def parse_area(text):
+    """lat,lon:radius_m, or blank."""
+    if not text:
+        return None
+    center, radius = text.split(":")
+    lat, lon = (float(value) for value in center.split(","))
+    return {"lat": lat, "lon": lon, "radius": float(radius)}
+
+
+def alert_settings(env):
+    settings = {}
+    for kind, (mode, _) in ALERTS.items():
+        key = "TELEMETRY_ALERT_" + kind.upper()
+        settings[kind] = {
+            "mode": env.get(key) or mode,
+            "webhook": env.get(key + "_WEBHOOK", ""),
+            "format": env.get(key + "_WEBHOOK_FORMAT", ""),
+        }
+    return settings
+
+
 def config_from_env(env):
+    number = lambda key, default: float(env.get(key) or default)
     return {
         "port": int(env.get("TELEMETRY_PORT", "8088")),
         "bind": env.get("TELEMETRY_BIND", "0.0.0.0"),
         "token": env["TELEMETRY_TOKEN"],
         "poll_secs": int(env.get("TELEMETRY_POLL_SECS", "10")),
-        "brake_mps2": float(env.get("TELEMETRY_BRAKE_MPS2", "4")),
-        "accel_mps2": float(env.get("TELEMETRY_ACCEL_MPS2", "4")),
-        "corner_mps2": float(env.get("TELEMETRY_CORNER_MPS2", "4")),
+        "brake_mps2": number("TELEMETRY_BRAKE_MPS2", 4),
+        "accel_mps2": number("TELEMETRY_ACCEL_MPS2", 4),
+        "corner_mps2": number("TELEMETRY_CORNER_MPS2", 4),
         "hold_ms": int(env.get("TELEMETRY_HOLD_MS", "250")),
         "keep_days": int(env.get("TELEMETRY_KEEP_DAYS", "30")),
         "webhook_url": env.get("TELEMETRY_WEBHOOK_URL", ""),
         "webhook_format": env.get("TELEMETRY_WEBHOOK_FORMAT", "json"),
         "webhook_gps": env.get("TELEMETRY_WEBHOOK_GPS", "0") == "1",
+        "impact_mps2": number("TELEMETRY_IMPACT_MPS2", 12),
+        "pothole_mps2": number("TELEMETRY_POTHOLE_MPS2", 4),
+        "swerve_steer_deg": number("TELEMETRY_SWERVE_STEER_DEG", 30),
+        "swerve_mps2": number("TELEMETRY_SWERVE_MPS2", 3),
+        "swerve_min_mph": number("TELEMETRY_SWERVE_MIN_MPH", 25),
+        "takeover_window_secs": number("TELEMETRY_TAKEOVER_WINDOW_SECS", 2),
+        "takeover_brake_mps2": number("TELEMETRY_TAKEOVER_BRAKE_MPS2", 2.5),
+        "takeover_steer_dps": number("TELEMETRY_TAKEOVER_STEER_DPS", 180),
+        "lane_min_mph": number("TELEMETRY_LANE_MIN_MPH", 35),
+        "blinker_secs": number("TELEMETRY_BLINKER_SECS", 30),
+        "blinker_min_mph": number("TELEMETRY_BLINKER_MIN_MPH", 45),
+        "speeding_mph": number("TELEMETRY_SPEEDING_MPH", 85),
+        "speeding_secs": number("TELEMETRY_SPEEDING_SECS", 5),
+        "speeding_zones": parse_zones(env.get("TELEMETRY_SPEEDING_ZONES", ""), with_limit=True),
+        "geofence_zones": parse_zones(env.get("TELEMETRY_GEOFENCE_ZONES", "")),
+        "unexpected_hours": env.get("TELEMETRY_UNEXPECTED_HOURS", ""),
+        "unexpected_area": parse_area(env.get("TELEMETRY_UNEXPECTED_AREA", "")),
+        "trip_min_miles": number("TELEMETRY_TRIP_MIN_MILES", 0.2),
+        "recording_stopped_secs": number("TELEMETRY_RECORDING_STOPPED_SECS", 300),
+        "drive_full_pct": number("TELEMETRY_DRIVE_FULL_PCT", 90),
+        "scratch_full_pct": number("TELEMETRY_SCRATCH_FULL_PCT", 80),
+        "sei_lost_clips": int(number("TELEMETRY_SEI_LOST_CLIPS", 240)),
+        "alerts": alert_settings(env),
     }
 
 
@@ -1043,6 +1688,7 @@ def scan_main(cfg):
             more = False
             try:
                 more = scanner.tick()
+                scanner.health()
                 failing = False
             except (OSError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as error:
                 # Say it once. A drive that stays broken must not fill the journal.
@@ -1062,15 +1708,16 @@ def serve_main(cfg):
     server = make_server(cfg, DB_PATH)
     server.stop = stop
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    if cfg.get("webhook_url"):
-        threading.Thread(target=alert_loop, args=(cfg, DB_PATH, stop), daemon=True).start()
+    threading.Thread(target=alert_loop, args=(cfg, DB_PATH, stop), daemon=True).start()
     say(f"telemetry API on {cfg['bind']}:{cfg['port']}")
     stop.wait()
     server.shutdown()
 
 
 def check_main(paths):
-    cfg = {"brake_mps2": 4.0, "accel_mps2": 4.0, "corner_mps2": 4.0, "hold_ms": 250}
+    cfg = config_from_env({"TELEMETRY_TOKEN": "check"})
+    for setting in cfg["alerts"].values():
+        setting["mode"] = "log"
     for path in paths:
         clip = read_clip(path)
         if clip is None:

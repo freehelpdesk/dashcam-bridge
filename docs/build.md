@@ -60,7 +60,7 @@ Bluetooth is disabled. The Wi-Fi and Bluetooth radios share one chip, and this b
 
 ## Configure, then provision
 
-On your computer, copy the repo to the Pi and edit the env file before the first successful provision. The first run copies it to `/etc/dashcam-bridge.env` mode `0600`. Later runs keep that copy. Change a live Pi by editing `/etc/dashcam-bridge.env` and running provision again.
+On your computer, copy the repo to the Pi and edit the env file before the first successful provision. The first run copies it to `/etc/dashcam-bridge.env` mode `0600`. Later runs keep your values, and add any new options to the end of that file as comments, after saving the old file as `/etc/dashcam-bridge.env.bak`. Change a live Pi by editing `/etc/dashcam-bridge.env` and running provision again.
 
 ```bash
 scp -r dashcam-bridge dashcam@dashcam.local:

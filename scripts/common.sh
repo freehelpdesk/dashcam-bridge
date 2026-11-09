@@ -8,6 +8,7 @@ STATE_DIR=/run/dashcam-bridge
 GADGET_ROOT=/sys/kernel/config/usb_gadget/dashcam
 LOCK_FILE=/run/dashcam-bridge/lock
 INBOX_MNT=/mnt/dashcam-inbox
+TELEMETRY_ALERT_NAMES=(hard_brake hard_accel hard_corner impact swerve pothole autopilot_takeover lane_no_blinker blinker_left_on speeding geofence unexpected_use trip_summary sentry_event saved_clip recording_stopped power_trouble storage_full telemetry_lost)
 
 log() {
   printf '%s\n' "$*"
@@ -112,7 +113,7 @@ validate_env() {
 }
 
 validate_telemetry() {
-  local name value
+  local name value alert key
   [[ $TELEMETRY == "0" || $TELEMETRY == "1" ]] || die "TELEMETRY must be 0 or 1"
   [[ $TELEMETRY_WRITE_LOG == "0" || $TELEMETRY_WRITE_LOG == "1" ]] || die "TELEMETRY_WRITE_LOG must be 0 or 1"
   if ((TELEMETRY == 0)); then
@@ -133,6 +134,35 @@ validate_telemetry() {
   [[ -z $TELEMETRY_WEBHOOK_URL || $TELEMETRY_WEBHOOK_URL == http://* || $TELEMETRY_WEBHOOK_URL == https://* ]] || die "TELEMETRY_WEBHOOK_URL must start with http:// or https://"
   [[ $TELEMETRY_WEBHOOK_FORMAT == "json" || $TELEMETRY_WEBHOOK_FORMAT == "text" ]] || die "TELEMETRY_WEBHOOK_FORMAT must be json or text"
   [[ $TELEMETRY_WEBHOOK_GPS == "0" || $TELEMETRY_WEBHOOK_GPS == "1" ]] || die "TELEMETRY_WEBHOOK_GPS must be 0 or 1"
+  for alert in "${TELEMETRY_ALERT_NAMES[@]}"; do
+    key=TELEMETRY_ALERT_${alert^^}
+    value=${!key:-}
+    [[ -z $value || $value == off || $value == log || $value == alert ]] || die "$key must be off, log, or alert"
+    name=${key}_WEBHOOK
+    value=${!name:-}
+    [[ -z $value || $value == http://* || $value == https://* ]] || die "$name must start with http:// or https://"
+    name=${key}_WEBHOOK_FORMAT
+    value=${!name:-}
+    [[ -z $value || $value == json || $value == text ]] || die "$name must be json or text"
+  done
+  # A blank number uses the default.
+  for name in TELEMETRY_IMPACT_MPS2 TELEMETRY_POTHOLE_MPS2 TELEMETRY_SWERVE_STEER_DEG TELEMETRY_SWERVE_MPS2 \
+    TELEMETRY_SWERVE_MIN_MPH TELEMETRY_TAKEOVER_WINDOW_SECS TELEMETRY_TAKEOVER_BRAKE_MPS2 TELEMETRY_TAKEOVER_STEER_DPS \
+    TELEMETRY_LANE_MIN_MPH TELEMETRY_BLINKER_SECS TELEMETRY_BLINKER_MIN_MPH TELEMETRY_SPEEDING_MPH TELEMETRY_SPEEDING_SECS \
+    TELEMETRY_TRIP_MIN_MILES TELEMETRY_RECORDING_STOPPED_SECS TELEMETRY_DRIVE_FULL_PCT TELEMETRY_SCRATCH_FULL_PCT TELEMETRY_SEI_LOST_CLIPS; do
+    value=${!name:-}
+    [[ -z $value || $value =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$name must be a number"
+  done
+  local zone='[A-Za-z0-9_-]+:-?[0-9.]+,-?[0-9.]+:[0-9.]+'
+  value=${TELEMETRY_GEOFENCE_ZONES:-}
+  [[ -z $value || $value =~ ^$zone(;$zone)*\;?$ ]] || die "TELEMETRY_GEOFENCE_ZONES must look like home:37.5,-122.1:150;work:37.4,-122.0:200"
+  zone="$zone:[0-9.]+"
+  value=${TELEMETRY_SPEEDING_ZONES:-}
+  [[ -z $value || $value =~ ^$zone(;$zone)*\;?$ ]] || die "TELEMETRY_SPEEDING_ZONES must look like school:37.5,-122.1:300:25"
+  value=${TELEMETRY_UNEXPECTED_AREA:-}
+  [[ -z $value || $value =~ ^-?[0-9.]+,-?[0-9.]+:[0-9.]+$ ]] || die "TELEMETRY_UNEXPECTED_AREA must look like 37.5,-122.1:50000"
+  value=${TELEMETRY_UNEXPECTED_HOURS:-}
+  [[ -z $value || ( $value =~ ^([0-9]{1,2})-([0-9]{1,2})$ && 10#${BASH_REMATCH[1]} -le 23 && 10#${BASH_REMATCH[2]} -le 23 ) ]] || die "TELEMETRY_UNEXPECTED_HOURS must look like 23-5"
 }
 
 # Fill NET_SSID, NET_PSK, NET_PRI, and NET_CON from WIFI_NET_1..8.
@@ -473,6 +503,64 @@ mount_share() {
   [[ -n $src ]] && blockdev --setra 2048 "$src" 2>/dev/null || true
   blockdev --setra 2048 /dev/mapper/dashcam-origin 2>/dev/null || true
   log "share mounted ($fstype, $(findmnt -n -o OPTIONS --mountpoint "$MNT" 2>/dev/null || echo unknown))"
+}
+
+# Print, as comments, the settings in the templates that the settings file does
+# not mention yet, each with the note written above it. A line that is already
+# commented out counts as mentioned, so a rerun adds nothing and an option you
+# removed on purpose stays removed.
+env_missing_options() {
+  awk '
+    FNR == 1 { note = "" }
+    FILENAME == ARGV[1] {
+      line = $0
+      sub(/^[ \t]*/, "", line)
+      sub(/^#[ \t]*/, "", line)
+      sub(/^export[ \t]+/, "", line)
+      if (line ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+        sub(/=.*/, "", line)
+        seen[line] = 1
+      }
+      next
+    }
+    /^[ \t]*$/ { note = ""; next }
+    /^#/ { note = note $0 "\n"; next }
+    /^[A-Za-z_][A-Za-z0-9_]*=/ {
+      key = $0
+      sub(/=.*/, "", key)
+      if (!(key in seen)) {
+        printf "%s# %s\n", note, $0
+        seen[key] = 1
+      }
+      note = ""
+    }
+  ' "$@"
+}
+
+# Add new options to the settings file as comments. Being comments, they cannot
+# change what the Pi does, and no value that is already there is touched.
+merge_env_options() {
+  local added template tmp="${ENV_FILE}.new"
+  local -a templates=()
+  for template in "$@"; do
+    [[ ! -f $template ]] || templates+=("$template")
+  done
+  ((${#templates[@]})) || return 0
+  added=$(env_missing_options "$ENV_FILE" "${templates[@]}")
+  [[ -n $added ]] || return 0
+  cp -p "$ENV_FILE" "${ENV_FILE}.bak"
+  chmod 600 "${ENV_FILE}.bak"
+  (
+    umask 077
+    {
+      cat "$ENV_FILE"
+      printf '\n# Added by provision. These are new options, shown at their defaults.\n'
+      printf '# Remove the # in front of a setting to change it.\n\n'
+      printf '%s\n' "$added"
+    } >"$tmp"
+  )
+  mv "$tmp" "$ENV_FILE"
+  log "added $(grep -c '^# [A-Za-z_][A-Za-z0-9_]*=' <<<"$added") new options to $ENV_FILE as comments (backup: ${ENV_FILE}.bak)"
 }
 
 # Filter the config.txt fragment on stdin. These lines sit inside the managed

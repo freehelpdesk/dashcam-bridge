@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -21,11 +22,27 @@ spec = importlib.util.spec_from_file_location("telemetry", os.path.join(SCRIPTS,
 telemetry = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(telemetry)
 
-CFG = {
-    "port": 0, "bind": "127.0.0.1", "token": "test-token-1234567890", "poll_secs": 10,
-    "brake_mps2": 4.0, "accel_mps2": 4.0, "corner_mps2": 4.0, "hold_ms": 250, "keep_days": 30,
-    "webhook_url": "https://example.invalid/hook", "webhook_format": "json", "webhook_gps": False,
-}
+CFG = telemetry.config_from_env({"TELEMETRY_TOKEN": "test-token-1234567890", "TELEMETRY_WEBHOOK_URL": "https://example.invalid/hook"})
+CFG.update(port=0, bind="127.0.0.1")
+
+
+def modes(cfg=CFG, **changes):
+    """A copy of cfg with some alert modes changed."""
+    out = json.loads(json.dumps(cfg))
+    for kind, mode in changes.items():
+        out["alerts"][kind]["mode"] = mode
+    return out
+
+
+def only(*kinds, **settings):
+    """A config with just these alerts on."""
+    out = modes(**{kind: "off" for kind in telemetry.ALERTS})
+    for kind in kinds:
+        out["alerts"][kind]["mode"] = "alert"
+    out.update(settings)
+    return out
+
+
 HZ = 36
 
 
@@ -45,14 +62,25 @@ def field(number, wire, payload):
     return varint((number << 3) | wire) + payload
 
 
-def proto(speed=0.0, forward=0.0, side=0.0, brake=False, gear=1, lat=None):
+def proto(speed=0.0, forward=0.0, side=0.0, brake=False, gear=1, lat=None, steering=0.0, autopilot=0,
+          blinker_left=False, z=0.0, heading=0.0):
     data = field(1, 0, varint(1)) + field(2, 0, varint(gear))
     if speed:
         data += field(4, 5, struct.pack("<f", speed))
+    if steering:
+        data += field(6, 5, struct.pack("<f", steering))
+    if blinker_left:
+        data += field(7, 0, varint(1))
     if brake:
         data += field(9, 0, varint(1))
+    if autopilot:
+        data += field(10, 0, varint(autopilot))
     if lat is not None:
         data += field(11, 1, struct.pack("<d", lat)) + field(12, 1, struct.pack("<d", -lat))
+    if heading:
+        data += field(13, 1, struct.pack("<d", heading))
+    if z:
+        data += field(16, 1, struct.pack("<d", z))
     if side:
         data += field(14, 1, struct.pack("<d", side))
     if forward:
@@ -254,10 +282,19 @@ class ScannerBase(unittest.TestCase):
         self.conn = telemetry.init_db(os.path.join(self.root, "t.db"))
         self.addCleanup(self.conn.close)
         self.writes = 1
+        self.flags = 0
+        self.boot = "boot-1"
+        self.scratch_pct = None
+        self.now = 1000.0
         self.views = 0
         self.held = True
+        patcher = mock.patch.object(telemetry, "drive_percent", return_value=10)  # Not this machine's disk.
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.scanner = telemetry.Scanner(
-            self.conn, CFG, view=self.view, lock=self.lock, exists=lambda: True, sectors=lambda: self.writes)
+            self.conn, CFG, view=self.view, lock=self.lock, exists=lambda: True, sectors=lambda: self.writes,
+            throttled=lambda: self.flags, boot_id=lambda: self.boot, scratch=lambda: self.scratch_pct,
+            clock=lambda: self.now, gadget=lambda: "configured")
         output = contextlib.redirect_stdout(io.StringIO())
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
@@ -417,6 +454,542 @@ class Scanning(ScannerBase):
         self.assertGreater(self.conn.execute("SELECT count(*) AS n FROM samples").fetchone()["n"], 0)
 
 
+def custom(fn, duration=60.0):
+    """A clip from fn(t), which returns keyword arguments for proto()."""
+    payloads = [proto(**fn(i / HZ)) for i in range(int(duration * HZ))]
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as handle:
+        handle.write(mp4(payloads, duration))
+        handle.flush()
+        return telemetry.read_clip(handle.name)
+
+
+def kinds_of(clip, cfg):
+    return [event["type"] for event in telemetry.detect_events(clip, cfg)]
+
+
+class NewDetectors(unittest.TestCase):
+    def test_modes_gate_detection(self):
+        clip = clip_from(brake_shape(10, 2.0))
+        self.assertEqual(kinds_of(clip, modes(hard_brake="off")), [])
+        self.assertEqual(kinds_of(clip, modes(hard_brake="log")), ["hard_brake"])
+
+    def test_impact_needs_only_a_few_frames(self):
+        clip = custom(lambda t: dict(speed=15.0, forward=-20.0 if 10 <= t < 10.06 else 0.0))
+        self.assertEqual(kinds_of(clip, only("impact")), ["impact"])
+
+    def test_single_frame_is_not_an_impact(self):
+        clip = custom(lambda t: dict(speed=15.0, forward=-20.0 if 10 <= t < 10.02 else 0.0))
+        self.assertEqual(kinds_of(clip, only("impact")), [])
+
+    def test_impact_reports_the_stop(self):
+        clip = custom(lambda t: dict(speed=15.0 if t < 10.1 else 0.0, forward=-20.0 if 10 <= t < 10.06 else 0.0))
+        self.assertTrue(telemetry.detect_events(clip, only("impact"))[0]["detail"]["stopped"])
+
+    def swerve(self, t):
+        if 10 <= t < 10.5:
+            return dict(speed=25.0, steering=20.0, side=4.0)
+        if 10.5 <= t < 11:
+            return dict(speed=25.0, steering=-20.0, side=-4.0)
+        return dict(speed=25.0)
+
+    def test_swerve(self):
+        self.assertEqual(kinds_of(custom(self.swerve), only("swerve")), ["swerve"])
+
+    def test_one_way_turn_is_not_a_swerve(self):
+        clip = custom(lambda t: dict(speed=25.0, steering=45.0 if 10 <= t < 15 else 0.0, side=4.0 if 10 <= t < 15 else 0.0))
+        self.assertEqual(kinds_of(clip, only("swerve")), [])
+
+    def test_slow_swerve_is_ignored(self):
+        clip = custom(lambda t: dict(self.swerve(t), speed=5.0))
+        self.assertEqual(kinds_of(clip, only("swerve")), [])
+
+    def test_pothole(self):
+        clip = custom(lambda t: dict(speed=15.0, z=6.0 if 10 <= t < 10.05 else 0.0))
+        self.assertEqual(kinds_of(clip, only("pothole")), ["pothole"])
+
+    def takeover(self, **during):
+        def shape(t):
+            base = dict(speed=20.0, autopilot=1 if t < 20 else 0)
+            if 19.5 <= t < 20.5:
+                base.update(during)
+            return base
+        return custom(shape)
+
+    def test_takeover_by_braking(self):
+        events = telemetry.detect_events(self.takeover(forward=-3.0), only("autopilot_takeover"))
+        self.assertEqual(events[0]["detail"]["cause"], "braking")
+        self.assertEqual(events[0]["detail"]["mode"], "self_driving")
+
+    def test_takeover_by_steering(self):
+        def shape(t):
+            return dict(speed=20.0, autopilot=1 if t < 20 else 0, steering=(t - 19.5) * 300 if 19.5 <= t < 20 else 0.0)
+        self.assertEqual(telemetry.detect_events(custom(shape), only("autopilot_takeover"))[0]["detail"]["cause"], "steering")
+
+    def test_calm_disengagement_is_quiet(self):
+        self.assertEqual(kinds_of(self.takeover(), only("autopilot_takeover")), [])
+
+    def test_engaging_is_quiet(self):
+        clip = custom(lambda t: dict(speed=20.0, autopilot=0 if t < 20 else 1, forward=-3.0 if 19 < t < 21 else 0.0))
+        self.assertEqual(kinds_of(clip, only("autopilot_takeover")), [])
+
+    def lane(self, **extra):
+        def shape(t):
+            heading = 100.0
+            if 10 <= t < 13:
+                heading += 3.0  # Angled across the lane, then straight again.
+            return dict(speed=25.0, heading=heading, **extra)
+        return custom(shape)
+
+    def test_lane_change_without_blinker(self):
+        self.assertEqual(kinds_of(self.lane(), only("lane_no_blinker")), ["lane_no_blinker"])
+
+    def test_lane_change_with_blinker_is_fine(self):
+        self.assertEqual(kinds_of(self.lane(blinker_left=True), only("lane_no_blinker")), [])
+
+    def test_autopilot_lane_change_is_fine(self):
+        self.assertEqual(kinds_of(self.lane(autopilot=1), only("lane_no_blinker")), [])
+
+    def test_straight_road_has_no_lane_change(self):
+        self.assertEqual(kinds_of(custom(lambda t: dict(speed=25.0, heading=100.0)), only("lane_no_blinker")), [])
+
+    def test_speeding_fixed_limit(self):
+        clip = custom(lambda t: dict(speed=40.0 if 10 <= t < 20 else 30.0))
+        events = telemetry.detect_events(clip, only("speeding", speeding_mph=80.0))
+        self.assertEqual(events[0]["detail"]["limit_mph"], 80.0)
+        self.assertAlmostEqual(events[0]["detail"]["top_mph"], 89.5, delta=0.1)
+
+    def test_brief_speeding_is_ignored(self):
+        clip = custom(lambda t: dict(speed=40.0 if 10 <= t < 12 else 30.0))
+        self.assertEqual(kinds_of(clip, only("speeding", speeding_mph=80.0)), [])
+
+    def test_smallest_speeding_zone_wins(self):
+        zones = [{"name": "town", "lat": 37.5, "lon": -37.5, "radius": 5000.0, "mph": 40.0},
+                 {"name": "school", "lat": 37.5, "lon": -37.5, "radius": 100.0, "mph": 20.0}]
+        clip = custom(lambda t: dict(speed=15.0, lat=37.5))
+        events = telemetry.detect_events(clip, only("speeding", speeding_mph=0.0, speeding_zones=zones))
+        self.assertEqual(events[0]["detail"]["limit_mph"], 20.0)
+
+    def test_zero_limit_without_zones_is_off(self):
+        clip = custom(lambda t: dict(speed=60.0, lat=37.5))
+        self.assertEqual(kinds_of(clip, only("speeding", speeding_mph=0.0)), [])
+
+
+class Tracking(ScannerBase):
+    def setUp(self):
+        super().setUp()
+        self.add_fn(0, lambda t: dict(speed=0.0, gear=0))
+        self.scanner.tick()
+
+    def add_fn(self, minute, fn):
+        payloads = [proto(**fn(i / HZ)) for i in range(60 * HZ)]
+        with open(os.path.join(self.clips, name_at(minute)), "wb") as handle:
+            handle.write(mp4(payloads, 60.0))
+        self.writes += 1
+
+    def run_clips(self, fns, cfg=None):
+        self.scanner.cfg = cfg or CFG
+        for minute, fn in fns:
+            self.add_fn(minute, fn)
+            self.scanner.tick()
+
+    def of(self, kind):
+        return [telemetry.event_public(row) for row in self.events() if row["type"] == kind]
+
+    def test_trip_summary_when_parked(self):
+        moving = lambda t: dict(speed=20.0, autopilot=1 if t < 30 else 0, gear=1)
+        parks = lambda t: dict(speed=20.0, gear=1) if t < 30 else dict(speed=0.0, gear=0)
+        self.run_clips([(1, moving), (2, moving), (3, parks)])
+        summary = self.of("trip_summary")[-1]["detail"]
+        self.assertGreater(summary["miles"], 1.8)
+        self.assertEqual(summary["top_mph"], 44.7)
+        self.assertGreater(summary["autopilot_pct"], 20)
+        self.assertEqual(len(self.of("trip_summary")), 1)
+
+    def test_trip_counts_events(self):
+        park = lambda t: dict(speed=0.0, gear=0)
+        self.run_clips([(1, lambda t: dict(speed=25.0, gear=1, forward=-6.0 if 10 <= t < 12 else 0.0) if t < 10 or t >= 12 else dict(speed=25.0 - 6 * (t - 10), forward=-6.0, gear=1)), (2, park)])
+        self.assertEqual(self.of("trip_summary")[-1]["detail"]["events"], {"hard_brake": 1})
+
+    def test_no_sei_ends_a_trip(self):
+        self.run_clips([(1, lambda t: dict(speed=20.0, gear=1))])
+        self.add(2, duration=0.0)
+        self.scanner.tick()
+        self.assertEqual(len(self.of("trip_summary")), 1)
+
+    def test_tiny_trip_is_not_reported(self):
+        self.run_clips([(1, lambda t: dict(speed=2.0 if t < 5 else 0.0, gear=1 if t < 5 else 0))])
+        self.assertEqual(self.of("trip_summary"), [])
+
+    def test_geofence_arrival_and_departure(self):
+        cfg = only("geofence", geofence_zones=[{"name": "home", "lat": 37.5, "lon": -37.5, "radius": 100.0}])
+        away = lambda t: dict(speed=10.0, lat=37.6)
+        here = lambda t: dict(speed=10.0, lat=37.5)
+        self.run_clips([(1, away), (2, here), (3, away)], cfg)
+        self.assertEqual([e["detail"]["action"] for e in self.of("geofence")], ["arrived", "left"])
+
+    def test_geofence_first_sighting_is_silent(self):
+        cfg = only("geofence", geofence_zones=[{"name": "home", "lat": 37.5, "lon": -37.5, "radius": 100.0}])
+        self.run_clips([(1, lambda t: dict(speed=10.0, lat=37.5))], cfg)
+        self.assertEqual(self.of("geofence"), [])
+
+    def test_geofence_edge_does_not_flap(self):
+        cfg = only("geofence", geofence_zones=[{"name": "home", "lat": 37.5, "lon": -37.5, "radius": 100.0}])
+        inside = lambda t: dict(speed=10.0, lat=37.5, )
+        edge = lambda t: dict(speed=10.0, lat=37.5 + 85 / 111195)  # About 110 m away, inside the exit margin.
+        self.run_clips([(1, inside), (2, edge), (3, inside)], cfg)
+        self.assertEqual(self.of("geofence"), [])
+
+    def test_quiet_hours_wrap_midnight(self):
+        moment = datetime.datetime(2026, 11, 7, 23, 30).timestamp()
+        noon = datetime.datetime(2026, 11, 7, 12, 0).timestamp()
+        early = datetime.datetime(2026, 11, 8, 4, 59).timestamp()
+        self.assertTrue(telemetry.in_quiet_hours(moment, "23-5"))
+        self.assertTrue(telemetry.in_quiet_hours(early, "23-5"))
+        self.assertFalse(telemetry.in_quiet_hours(noon, "23-5"))
+        self.assertFalse(telemetry.in_quiet_hours(noon, ""))
+
+    def test_unexpected_quiet_hours_once_per_trip(self):
+        moving = lambda t: dict(speed=10.0, gear=1)
+        self.run_clips([(1, moving), (2, moving)], only("unexpected_use", unexpected_hours="0-0"))
+        self.assertEqual(self.of("unexpected_use"), [])
+        self.run_clips([(3, lambda t: dict(speed=0.0, gear=0))], only("unexpected_use", unexpected_hours="18-19"))
+        self.run_clips([(4, moving), (5, moving)], only("unexpected_use", unexpected_hours="18-19"))
+        self.assertEqual([e["detail"]["reason"] for e in self.of("unexpected_use")], ["quiet hours"])
+
+    def test_outside_area_alerts_once(self):
+        cfg = only("unexpected_use", unexpected_area={"lat": 37.5, "lon": -37.5, "radius": 1000.0})
+        outside = lambda t: dict(speed=10.0, gear=1, lat=38.5)
+        self.run_clips([(1, outside), (2, outside)], cfg)
+        self.assertEqual([e["detail"]["reason"] for e in self.of("unexpected_use")], ["outside the allowed area"])
+
+    def test_blinker_left_on_spans_clips(self):
+        cfg = only("blinker_left_on", blinker_secs=30.0)
+        late = lambda t: dict(speed=30.0, blinker_left=t >= 45)
+        early = lambda t: dict(speed=30.0, blinker_left=True)
+        self.run_clips([(1, late), (2, early)], cfg)
+        found = self.of("blinker_left_on")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["detail"]["side"], "left")
+
+    def test_separate_blinks_do_not_add_up(self):
+        def shape(t):
+            return dict(speed=30.0, blinker_left=t < 20 or t >= 30)
+        self.run_clips([(1, shape)], only("blinker_left_on", blinker_secs=35.0))
+        self.assertEqual(self.of("blinker_left_on"), [])
+
+    def test_blinker_at_low_speed_is_fine(self):
+        self.run_clips([(1, lambda t: dict(speed=5.0, blinker_left=True))], only("blinker_left_on", blinker_secs=30.0))
+        self.assertEqual(self.of("blinker_left_on"), [])
+
+    def test_lost_sei_after_many_clips(self):
+        self.scanner.cfg = only("telemetry_lost", sei_lost_clips=3)
+        for minute in range(1, 6):
+            self.add(minute, duration=0.0)
+            self.scanner.tick()
+        self.assertEqual(len(self.of("telemetry_lost")), 1)
+
+    def test_sei_return_rearms_the_alert(self):
+        self.scanner.cfg = only("telemetry_lost", sei_lost_clips=2)
+        for minute in (1, 2):
+            self.add(minute, duration=0.0)
+            self.scanner.tick()
+        self.add(3)
+        self.scanner.tick()
+        for minute in (4, 5):
+            self.add(minute, duration=0.0)
+            self.scanner.tick()
+        self.assertEqual(len(self.of("telemetry_lost")), 2)
+
+    def test_state_survives_a_restart(self):
+        self.run_clips([(1, lambda t: dict(speed=20.0, gear=1))])
+        self.scanner = telemetry.Scanner(self.conn, CFG, view=self.view, lock=self.lock, exists=lambda: True, sectors=lambda: self.writes)
+        self.run_clips([(2, lambda t: dict(speed=0.0, gear=0))])
+        self.assertGreater(self.of("trip_summary")[-1]["detail"]["miles"], 0.5)
+
+
+class Folders(ScannerBase):
+    def setUp(self):
+        super().setUp()
+        self.base = os.path.join(self.root, "TeslaCam")
+        for folder in ("SentryClips", "SavedClips"):
+            os.makedirs(os.path.join(self.base, folder))
+        self.start()
+        self.scan()
+
+    def scan(self):
+        self.writes += 1
+        self.scanner.tick()
+
+    def folder(self, where, name, info=None):
+        path = os.path.join(self.base, where, name)
+        os.makedirs(path)
+        if info is not None:
+            with open(os.path.join(path, "event.json"), "w") as handle:
+                json.dump(info, handle)
+
+    def test_existing_folders_are_not_news(self):
+        self.assertEqual(self.events(), [])
+
+    def test_new_sentry_folder_alerts_with_reason(self):
+        self.folder("SentryClips", "2026-11-07_17-24-45", {"reason": "sentry_aware_object_detection", "est_lat": "37.5", "est_lon": "-122", "city": "Town", "street": "Main"})
+        self.scan()
+        event = telemetry.row_dict(self.events()[0])
+        self.assertEqual((event["type"], event["alert_state"]), ("sentry_event", "pending"))
+        self.assertIn("sentry aware object detection", telemetry.event_message(event))
+        self.assertEqual(self.events()[0]["lat"], 37.5)
+
+    def test_location_stays_out_of_the_webhook(self):
+        self.folder("SavedClips", "2026-11-07_17-24-45", {"reason": "vehicle_auto_emergency_braking", "city": "Secretville", "street": "Hidden Rd", "est_lat": "37.5", "est_lon": "-122"})
+        self.scan()
+        event = telemetry.row_dict(self.events()[0])
+        data, _ = telemetry.alert_request(event, CFG)
+        self.assertNotIn(b"Secretville", data)
+        self.assertNotIn(b"Hidden Rd", data)
+        self.assertNotIn(b"37.5", data)
+        data, _ = telemetry.alert_request(event, dict(CFG, webhook_gps=True))
+        self.assertIn(b"Secretville", data)
+
+    def test_waits_for_event_json(self):
+        self.folder("SentryClips", "2026-11-07_17-24-45")
+        self.scan()
+        self.assertEqual(self.events(), [])
+        with open(os.path.join(self.base, "SentryClips", "2026-11-07_17-24-45", "event.json"), "w") as handle:
+            json.dump({"reason": "late"}, handle)
+        self.scanner.tick()  # Retries with no new writes.
+        self.assertEqual(json.loads(self.events()[0]["detail"])["reason"], "late")
+
+    def test_missing_event_json_is_reported_eventually(self):
+        self.folder("SentryClips", "2026-11-07_17-24-45")
+        for _ in range(telemetry.FOLDER_RETRIES):
+            self.scan()
+        self.assertEqual(json.loads(self.events()[0]["detail"])["reason"], "unknown")
+        self.assertEqual(len(self.events()), 1)
+
+    def test_junk_event_json_is_survived(self):
+        self.folder("SentryClips", "2026-11-07_17-24-45", ["not", "a", "dict"])
+        self.scan()
+        self.assertEqual(len(self.events()), 1)
+
+    def test_off_means_no_event_and_no_backlog(self):
+        self.scanner.cfg = modes(sentry_event="off")
+        self.folder("SentryClips", "2026-11-07_17-24-45", {"reason": "x"})
+        self.scan()
+        self.scanner.cfg = CFG
+        self.scan()
+        self.assertEqual(self.events(), [])
+
+    def test_macos_junk_folders_are_ignored(self):
+        self.folder("SentryClips", ".Spotlight", {"reason": "x"})
+        self.scan()
+        self.assertEqual(self.events(), [])
+
+
+class Health(ScannerBase):
+    def setUp(self):
+        super().setUp()
+        self.scanner.cfg = only("power_trouble", "recording_stopped", "storage_full", "telemetry_lost")
+
+    def kinds(self):
+        return [row["type"] for row in self.events()]
+
+    def test_power_flag_alerts_once(self):
+        self.flags = 0x10000
+        self.scanner.health()
+        self.scanner.health()
+        self.assertEqual(self.kinds(), ["power_trouble"])
+        self.assertEqual(json.loads(self.events()[0]["detail"])["flags"], ["undervoltage"])
+
+    def test_a_second_flag_alerts_too(self):
+        self.flags = 0x10000
+        self.scanner.health()
+        self.flags = 0x50000
+        self.scanner.health()
+        self.assertEqual(json.loads(self.events()[1]["detail"])["flags"], ["throttled"])
+
+    def test_power_flags_rearm_after_a_reboot(self):
+        self.flags = 0x10000
+        self.scanner.health()
+        self.boot = "boot-2"
+        self.scanner.health()
+        self.assertEqual(len(self.kinds()), 2)
+
+    def test_no_vcgencmd_is_quiet(self):
+        self.flags = None
+        self.scanner.health()
+        self.assertEqual(self.kinds(), [])
+
+    def moving(self):
+        self.add(0)
+        self.scanner.tick()
+
+    def test_recording_stopped_mid_drive(self):
+        self.moving()
+        self.now += 299
+        self.scanner.health()
+        self.assertEqual(self.kinds(), [])
+        self.now += 2
+        self.scanner.health()
+        self.scanner.health()
+        self.assertEqual(self.kinds(), ["recording_stopped"])
+
+    def test_parked_car_is_not_a_stopped_recording(self):
+        self.now += 10000
+        self.scanner.health()
+        self.assertEqual(self.kinds(), [])
+
+    def test_new_clip_rearms_recording(self):
+        self.moving()
+        self.now += 400
+        self.scanner.health()
+        self.add(1)
+        self.scanner.tick()
+        self.now += 400
+        self.scanner.health()
+        self.assertEqual(self.kinds(), ["recording_stopped", "recording_stopped"])
+
+    def test_scratch_alerts_once_and_rearms(self):
+        self.scratch_pct = 85
+        self.scanner.health()
+        self.scanner.health()
+        self.assertEqual(len(self.kinds()), 1)
+        self.scratch_pct = 79
+        self.scanner.health()
+        self.scratch_pct = 85
+        self.scanner.health()
+        self.assertEqual(len(self.kinds()), 1)  # 79 is inside the margin.
+        self.scratch_pct = 70
+        self.scanner.health()
+        self.scratch_pct = 85
+        self.scanner.health()
+        self.assertEqual(len(self.kinds()), 2)
+
+    def test_drive_full(self):
+        self.start()
+        with mock.patch.object(telemetry, "drive_percent", return_value=95):
+            self.writes += 1
+            self.scanner.tick()
+        self.assertEqual(json.loads(self.events()[0]["detail"])["which"], "drive")
+
+    def test_encrypted_clips_appearing(self):
+        path = os.path.join(self.root, telemetry.ENCRYPTED_DIR)
+        os.makedirs(path)
+        self.start()
+        open(os.path.join(path, "x"), "w").close()
+        self.writes += 1
+        self.scanner.tick()
+        self.assertEqual(self.kinds(), ["telemetry_lost"])
+
+
+class Routing(ScannerBase):
+    def event_of(self, kind, cfg):
+        with self.conn:
+            telemetry.record_event(self.conn, cfg, telemetry._state_event(kind, 100.0, reason="x"), "", True)
+        return telemetry.row_dict(self.events()[-1])
+
+    def own(self, **hooks):
+        cfg = json.loads(json.dumps(CFG))
+        for kind, url in hooks.items():
+            cfg["alerts"][kind]["webhook"] = url
+        return cfg
+
+    def test_own_webhook_wins(self):
+        self.assertEqual(telemetry.alert_target("sentry_event", self.own(sentry_event="https://own"))[0], "https://own")
+
+    def test_default_webhook_otherwise(self):
+        self.assertEqual(telemetry.alert_target("saved_clip", CFG)[0], CFG["webhook_url"])
+
+    def test_own_format_wins(self):
+        cfg = self.own()
+        cfg["alerts"]["sentry_event"]["format"] = "text"
+        event = self.event_of("sentry_event", cfg)
+        self.assertTrue(telemetry.alert_request(event, cfg)[1].startswith("text/plain"))
+        self.assertEqual(telemetry.alert_target("saved_clip", cfg)[1], "json")
+
+    def test_log_mode_is_never_sent(self):
+        self.assertEqual(self.event_of("sentry_event", modes(sentry_event="log"))["alert_state"], "none")
+
+    def test_own_webhook_works_with_no_default(self):
+        cfg = self.own(sentry_event="https://own")
+        cfg["webhook_url"] = ""
+        self.assertEqual(self.event_of("sentry_event", cfg)["alert_state"], "pending")
+        cfg2 = dict(cfg)
+        self.assertEqual(self.event_of("saved_clip", cfg2)["alert_state"], "none")
+
+    def test_one_dead_webhook_does_not_block_another(self):
+        cfg = self.own(sentry_event="https://dead", saved_clip="https://alive")
+        self.event_of("sentry_event", cfg)
+        self.event_of("saved_clip", cfg)
+        delivered = []
+
+        def post(event, config):
+            url = telemetry.alert_target(event["type"], config)[0]
+            if url == "https://dead":
+                raise OSError("down")
+            delivered.append(url)
+        telemetry.send_alerts(self.conn, cfg, post=post)
+        self.assertEqual(delivered, ["https://alive"])
+
+    def test_dead_webhook_is_tried_once_per_pass(self):
+        cfg = self.own(sentry_event="https://dead")
+        for _ in range(3):
+            self.event_of("sentry_event", cfg)
+        tries = []
+
+        def post(event, config):
+            tries.append(event["id"])
+            raise OSError("down")
+        telemetry.send_alerts(self.conn, cfg, post=post)
+        self.assertEqual(len(tries), 1)
+
+    def test_every_alert_has_a_message(self):
+        details = {
+            "autopilot_takeover": dict(mode="self_driving", cause="braking"), "lane_no_blinker": dict(offset_m=3.0),
+            "blinker_left_on": dict(side="left", seconds=30), "speeding": dict(top_mph=90.0, limit_mph=85.0),
+            "geofence": dict(zone="home", action="arrived"), "unexpected_use": dict(reason="quiet hours"),
+            "trip_summary": dict(miles=1.0, minutes=2.0, top_mph=30.0, autopilot_pct=5, events={}),
+            "sentry_event": dict(reason="x"), "saved_clip": dict(reason="x"),
+            "recording_stopped": dict(minutes=5.0, usb="configured"), "power_trouble": dict(flags=["undervoltage"]),
+            "storage_full": dict(which="drive", percent=91), "telemetry_lost": dict(reason="x"), "impact": dict(stopped=True),
+        }
+        for kind in telemetry.ALERTS:
+            event = {"type": kind, "start_t": 100.0, "peak": 5.0, "speed_start": 10.0, "detail": json.dumps(details.get(kind, {}))}
+            self.assertTrue(telemetry.event_message(event), kind)
+
+
+class AlertConfig(unittest.TestCase):
+    def test_modes_and_webhooks_from_env(self):
+        cfg = telemetry.config_from_env({
+            "TELEMETRY_TOKEN": "x", "TELEMETRY_ALERT_POTHOLE": "log", "TELEMETRY_ALERT_POTHOLE_WEBHOOK": "https://p",
+            "TELEMETRY_ALERT_POTHOLE_WEBHOOK_FORMAT": "text"})
+        self.assertEqual(cfg["alerts"]["pothole"], {"mode": "log", "webhook": "https://p", "format": "text"})
+
+    def test_blank_values_use_defaults(self):
+        cfg = telemetry.config_from_env({"TELEMETRY_TOKEN": "x", "TELEMETRY_ALERT_HARD_BRAKE": "", "TELEMETRY_IMPACT_MPS2": ""})
+        self.assertEqual((cfg["alerts"]["hard_brake"]["mode"], cfg["impact_mps2"]), ("alert", 12.0))
+
+    def test_zones_parse(self):
+        zones = telemetry.parse_zones("home:37.5,-122.1:150;work:37.4,-122.0:200;")
+        self.assertEqual([z["name"] for z in zones], ["home", "work"])
+        self.assertEqual(zones[0]["lon"], -122.1)
+        self.assertEqual(telemetry.parse_zones("s:1,2:300:25", with_limit=True)[0]["mph"], 25.0)
+
+    def test_bad_zone_is_refused(self):
+        with self.assertRaises(ValueError):
+            telemetry.parse_zones("home:37.5:150")
+
+    def test_shell_and_python_list_the_same_alerts(self):
+        with open(os.path.join(SCRIPTS, "common.sh")) as handle:
+            listed = re.search(r"^TELEMETRY_ALERT_NAMES=\((.*)\)$", handle.read(), re.M).group(1).split()
+        self.assertEqual(listed, list(telemetry.ALERTS))
+
+    def test_template_has_a_mode_and_webhook_for_each(self):
+        with open(os.path.join(SCRIPTS, "..", "config", "dashcam-bridge.env")) as handle:
+            template = handle.read()
+        for kind, (mode, _) in telemetry.ALERTS.items():
+            key = "TELEMETRY_ALERT_" + kind.upper()
+            self.assertIn(f"\n{key}={mode}\n{key}_WEBHOOK=\n", template, kind)
+
+
 class DriveView(unittest.TestCase):
     def setUp(self):
         self.calls = []
@@ -515,7 +1088,7 @@ class Alerts(ScannerBase):
     def test_text_format(self):
         data, kind = telemetry.alert_request(self.event(), dict(CFG, webhook_format="text"))
         self.assertTrue(kind.startswith("text/plain"))
-        self.assertTrue(data.decode().startswith("Hard braking: 6.0"))
+        self.assertRegex(data.decode(), r"^Hard braking at \d\d:\d\d:\d\d: 6\.0")
 
     def test_sent_alert_is_marked(self):
         self.event()
@@ -627,6 +1200,17 @@ class ApiServer(ScannerBase):
         _, status = self.get("/status")
         self.assertEqual(status["last_clip"], name_at(0))
         self.assertEqual(status["events"], 1)
+        self.assertEqual(status["alerts"]["hard_brake"], {"mode": "alert", "webhook": True})
+        self.assertEqual(status["alerts"]["swerve"]["mode"], "off")
+
+    def test_status_never_shows_a_webhook_url(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/status", headers={"Authorization": "Bearer " + CFG["token"]})
+        self.assertNotIn(b"example.invalid", conn.getresponse().read())
+        conn.close()
+
+    def test_event_detail_is_an_object(self):
+        self.assertEqual(self.get("/events")[1][0]["detail"], {})
 
     def test_bad_query_is_400(self):
         self.assertEqual(self.get("/samples?since=yesterday")[0], 400)

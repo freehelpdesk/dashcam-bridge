@@ -238,6 +238,299 @@ NET_INSTALL_AT_POWER_ON=1'
     "$(printf '[all]\nBOOT_ORDER=0xf1\n[gpio8=0]\nBOOT_ORDER=0xf7\n' | eeprom_boot_tuned 3000 | lines)"
 fi
 
+# --- adding new options to the settings file --------------------------------
+
+merge_scenario() {
+  MERGE=$(mktemp -d)
+  cat >"$MERGE/template" <<'TEMPLATE'
+# Header that belongs to nothing.
+
+# How the new thing works.
+# It has two lines of notes.
+NEW_THING=7
+NEW_OTHER=8
+
+# About the old thing.
+OLD_THING=template-value
+
+# Commented by the user.
+USER_REMOVED=1
+
+# Blank value.
+NEW_BLANK=
+TEMPLATE
+  printf 'OLD_THING=my-value\n#USER_REMOVED=1\nexport OLD_EXPORTED=1\n' >"$MERGE/env"
+  chmod 640 "$MERGE/env"
+  ENV_FILE=$MERGE/env
+}
+
+merge_scenario
+BEFORE=$(cat "$MERGE/env")
+merge_env_options "$MERGE/template" >/dev/null
+AFTER=$(cat "$MERGE/env")
+check "existing settings are untouched" "$BEFORE" "$(head -n 3 "$MERGE/env")"
+check "new options are added as comments" "# NEW_THING=7|# NEW_OTHER=8|# NEW_BLANK=" \
+  "$(grep -E '^# NEW_[A-Z]+=' "$MERGE/env" | paste -s -d '|' -)"
+check "the note above an option comes with it" 1 "$(grep -c '^# How the new thing works.$' "$MERGE/env")"
+check "notes for existing options are not added" 0 "$(grep -c 'About the old thing' "$MERGE/env")"
+check "unrelated notes are not added" 0 "$(grep -c 'Header that belongs' "$MERGE/env")"
+check "an option you commented out stays out" 1 "$(grep -c 'USER_REMOVED' "$MERGE/env")"
+check "a new option does not take effect" "" "$(unset NEW_THING; source "$MERGE/env"; printf '%s' "${NEW_THING:-}")"
+check "an existing value still wins" my-value "$(source "$MERGE/env"; printf '%s' "$OLD_THING")"
+check "the backup is the original" "$BEFORE" "$(cat "$MERGE/env.bak")"
+check "the settings file stays private" "-rw-------" "$(ls -l "$MERGE/env" | cut -c1-10)"
+check "the backup stays private" "-rw-------" "$(ls -l "$MERGE/env.bak" | cut -c1-10)"
+check "no temp file is left" no "$([[ -e $MERGE/env.new ]] && echo yes || echo no)"
+echo changed >"$MERGE/env.bak"
+merge_env_options "$MERGE/template" >/dev/null
+check "a rerun adds nothing" "$AFTER" "$(cat "$MERGE/env")"
+check "a rerun leaves the backup alone" changed "$(cat "$MERGE/env.bak")"
+rm -rf "$MERGE"
+
+merge_scenario
+printf 'SECOND_ONLY=1\nNEW_THING=99\n' >"$MERGE/second"
+merge_env_options "$MERGE/missing" "$MERGE/template" "$MERGE/second" >/dev/null
+check "a missing template is skipped" 1 "$(grep -c '^# NEW_OTHER=8$' "$MERGE/env")"
+check "the first template wins" "# NEW_THING=7" "$(grep '^# NEW_THING=' "$MERGE/env")"
+check "later templates add what is left" 1 "$(grep -c '^# SECOND_ONLY=1$' "$MERGE/env")"
+rm -rf "$MERGE"
+
+merge_scenario
+merge_env_options "$MERGE/nope" >/dev/null
+check "no template changes nothing" no "$([[ -e $MERGE/env.bak ]] && echo yes || echo no)"
+rm -rf "$MERGE"
+
+merge_scenario
+printf '# note\nOLD_THING=x\n' >"$MERGE/template"
+merge_env_options "$MERGE/template" >/dev/null
+check "nothing new leaves the file alone" no "$([[ -e $MERGE/env.bak ]] && echo yes || echo no)"
+rm -rf "$MERGE"
+
+merge_scenario
+: >"$MERGE/env"
+merge_env_options "$SCRIPTS/../config/dashcam-bridge.env" >/dev/null
+check "the real template only adds comments and blanks" 0 "$(grep -cvE '^(#.*)?$' "$MERGE/env")"
+check "provision adds new options" 1 "$(grep -c 'merge_env_options' "$SCRIPTS/provision.sh")"
+ENV_FILE=/etc/dashcam-bridge.env
+rm -rf "$MERGE"
+
+# --- pushing from a Mac -----------------------------------------------------
+
+PUSH=$SCRIPTS/../tools/push-to-pi.sh
+if [[ -f $PUSH ]]; then
+  # macOS ships bash 3.2, so that is what this has to run under.
+  PUSH_BASH=/bin/bash
+  check "push script parses" 0 "$("$PUSH_BASH" -n "$PUSH" >/dev/null 2>&1; echo $?)"
+
+  push_sandbox() {
+    STUB=$(mktemp -d)
+    mkdir -p "$STUB/bin" "$STUB/home"
+    cat >"$STUB/bin/ssh" <<'STUB_SSH'
+#!/bin/bash
+while (($#)); do
+  case $1 in
+    -o) shift 2 ;;
+    -O) exit 0 ;;
+    -t | -T | -n) shift ;;
+    *) break ;;
+  esac
+done
+shift # the host
+case $* in
+  *preflight*)
+    cat >/dev/null
+    echo "$STUB_PREFLIGHT"
+    exit 0
+    ;;
+  *.incoming*tar*)
+    if [[ ${STUB_FAIL_UPLOAD:-} == 1 ]]; then
+      cat >/dev/null
+      exit 1
+    fi
+    if [[ ${STUB_LOSE_FILE:-} == 1 ]]; then
+      HOME=$STUB/home /bin/bash -c "$*"
+      rm -f "$STUB/home/dashcam-bridge.incoming/README.md"
+      exit 0
+    fi
+    ;;
+esac
+HOME=$STUB/home exec /bin/bash -c "$*"
+STUB_SSH
+    cat >"$STUB/bin/sudo" <<'STUB_SUDO'
+#!/bin/bash
+[[ $1 != -n ]] || shift
+echo "$*" >>"$STUB/calls"
+case $1 in
+  ./scripts/provision.sh)
+    echo provisioning
+    [[ ${STUB_NEEDS_REBOOT:-} != 1 ]] || echo "reboot to apply the boot settings: sudo reboot"
+    exit "${STUB_PROVISION_RC:-0}"
+    ;;
+esac
+STUB_SUDO
+    cat >"$STUB/bin/systemctl" <<'STUB_SYSTEMCTL'
+#!/bin/bash
+printf '%s\n' active active "${STUB_SHARE_STATE:-active}"
+STUB_SYSTEMCTL
+    chmod +x "$STUB/bin/"*
+    export STUB STUB_PREFLIGHT="provisioned=1 busy=0 usb=configured"
+    unset STUB_LOSE_FILE STUB_FAIL_UPLOAD STUB_NEEDS_REBOOT STUB_PROVISION_RC STUB_SHARE_STATE
+  }
+  push_run() { # stdin is not a terminal, like any script
+    PATH=$STUB/bin:$PATH PUSH_REBOOT_WAIT=0 PUSH_POLL_SECS=0 "$PUSH_BASH" "$PUSH" --host pi@test --skip-tests "$@" </dev/null 2>&1
+  }
+  push_calls() {
+    [[ ! -f $STUB/calls ]] || paste -s -d '|' - <"$STUB/calls"
+  }
+
+  push_sandbox
+  push_run --sync-only >/dev/null
+  check "sync copies the tree" yes "$([[ -f $STUB/home/dashcam-bridge/scripts/provision.sh ]] && echo yes)"
+  check "sync keeps scripts executable" yes "$([[ -x $STUB/home/dashcam-bridge/scripts/provision.sh ]] && echo yes)"
+  check "sync leaves no staging folder" no "$([[ -e $STUB/home/dashcam-bridge.incoming ]] && echo yes || echo no)"
+  check "sync restarts nothing" "" "$(push_calls)"
+  check "a provisioned Pi does not get the repo's env file" no \
+    "$([[ -e $STUB/home/dashcam-bridge/config/dashcam-bridge.env ]] && echo yes || echo no)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  mkdir -p "$STUB/home/dashcam-bridge/config"
+  echo KEEP_ME=1 >"$STUB/home/dashcam-bridge/config/dashcam-bridge.env"
+  echo stale >"$STUB/home/dashcam-bridge/deleted-on-the-mac"
+  push_run --sync-only >/dev/null
+  check "the Pi's own env file survives a push" KEEP_ME=1 "$(cat "$STUB/home/dashcam-bridge/config/dashcam-bridge.env")"
+  check "files deleted on the Mac go away" no "$([[ -e $STUB/home/dashcam-bridge/deleted-on-the-mac ]] && echo yes || echo no)"
+  check "the last version is kept for rollback" yes "$([[ -e $STUB/home/dashcam-bridge.previous/deleted-on-the-mac ]] && echo yes)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  STUB_PREFLIGHT="provisioned=0 busy=0 usb=none"
+  push_run --sync-only >/dev/null
+  check "a new Pi gets the env file to fill in" yes "$([[ -f $STUB/home/dashcam-bridge/config/dashcam-bridge.env ]] && echo yes)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  STUB_PREFLIGHT="provisioned=1 busy=1 usb=configured"
+  OUTPUT=$(push_run)
+  check "push refuses while the car is writing" 1 "$(grep -c 'being written to' <<<"$OUTPUT")"
+  check "a refused push sends nothing" no "$([[ -e $STUB/home/dashcam-bridge ]] && echo yes || echo no)"
+  check "a refused push runs nothing" "" "$(push_calls)"
+  push_run --force >/dev/null
+  check "force goes ahead" ./scripts/provision.sh "$(push_calls)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  STUB_PREFLIGHT="provisioned=1 busy=1 usb=configured"
+  push_run --sync-only >/dev/null
+  check "sync-only is safe while the car writes" yes "$([[ -d $STUB/home/dashcam-bridge ]] && echo yes)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  push_run >/dev/null
+  check "normal push runs provision" ./scripts/provision.sh "$(push_calls)"
+  check "provision output is logged" provisioning "$(cat "$STUB/home/.dashcam-bridge-push.log")"
+  rm -rf "$STUB"
+
+  push_sandbox
+  STUB_NEEDS_REBOOT=1
+  export STUB_NEEDS_REBOOT
+  OUTPUT=$(push_run)
+  check "a needed reboot is left to you" ./scripts/provision.sh "$(push_calls)"
+  check "and it warns the drive is down" 1 "$(grep -c 'stays down until then' <<<"$OUTPUT")"
+  push_run --reboot >/dev/null
+  check "--reboot reboots when needed" "./scripts/provision.sh|./scripts/provision.sh|reboot" "$(push_calls)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  push_run --reboot >/dev/null
+  check "--reboot does nothing when not needed" ./scripts/provision.sh "$(push_calls)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  mkdir -p "$STUB/home/dashcam-bridge"
+  echo original >"$STUB/home/dashcam-bridge/marker"
+  STUB_FAIL_UPLOAD=1
+  export STUB_FAIL_UPLOAD
+  OUTPUT=$(push_run)
+  check "a failed upload says so" 1 "$(grep -c 'upload failed' <<<"$OUTPUT")"
+  check "a failed upload keeps the old copy" original "$(cat "$STUB/home/dashcam-bridge/marker")"
+  check "a failed upload runs nothing" "" "$(push_calls)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  mkdir -p "$STUB/home/dashcam-bridge"
+  echo original >"$STUB/home/dashcam-bridge/marker"
+  STUB_LOSE_FILE=1
+  export STUB_LOSE_FILE
+  PUSH_RC=0
+  OUTPUT=$(push_run) || PUSH_RC=$?
+  check "a partial upload is an error" 1 "$PUSH_RC"
+  check "a partial upload keeps the old copy" original "$(cat "$STUB/home/dashcam-bridge/marker")"
+  check "a partial upload leaves no staging folder" no "$([[ -e $STUB/home/dashcam-bridge.incoming ]] && echo yes || echo no)"
+  check "a partial upload runs nothing" "" "$(push_calls)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  (cd / && push_run --sync-only >/dev/null)
+  check "a push works from any folder" yes "$([[ -f $STUB/home/dashcam-bridge/scripts/provision.sh ]] && echo yes)"
+  rm -rf "$STUB"
+
+  push_sandbox
+  PUSH_REPO=$(mktemp -d)
+  mkdir -p "$PUSH_REPO/tools" "$PUSH_REPO/scripts" "$PUSH_REPO/config"
+  cp "$PUSH" "$PUSH_REPO/tools/"
+  echo '#!/bin/bash' >"$PUSH_REPO/scripts/provision.sh"
+  cat >"$PUSH_REPO/config/dashcam-bridge.env" <<'SECRETS'
+# A note.
+WIFI_NET_1_SSID=house-secret
+WIFI_NET_1_PSK=psk-secret
+SMB_PASSWORD=smb-secret
+TELEMETRY_TOKEN=token-secret
+TELEMETRY_WEBHOOK_URL=https://url-secret
+TELEMETRY_ALERT_SWERVE_WEBHOOK=https://hook-secret
+TELEMETRY_ALERT_SWERVE_WEBHOOK_FORMAT=text
+TELEMETRY_BRAKE_MPS2=4
+SECRETS
+  git -C "$PUSH_REPO" init -q
+  git -C "$PUSH_REPO" add -A
+  PATH=$STUB/bin:$PATH "$PUSH_BASH" "$PUSH_REPO/tools/push-to-pi.sh" --host pi@test --skip-tests --sync-only </dev/null >/dev/null 2>&1
+  PUSHED=$STUB/home/dashcam-bridge/config/dashcam-bridge.env.defaults
+  check "the Pi gets the list of options" 1 "$(grep -c '^TELEMETRY_BRAKE_MPS2=4$' "$PUSHED")"
+  check "nothing private goes in the list" 0 "$(grep -c 'secret' "$PUSHED")"
+  check "private options are still listed" 1 "$(grep -c '^TELEMETRY_TOKEN=$' "$PUSHED")"
+  check "a webhook format is not private" 1 "$(grep -c 'SWERVE_WEBHOOK_FORMAT=text$' "$PUSHED")"
+  check "nothing private is sent anywhere" 0 "$(grep -rl 'secret' "$STUB/home" 2>/dev/null | wc -l | tr -d ' ')"
+  rm -rf "$STUB" "$PUSH_REPO"
+
+  push_sandbox
+  STUB_PROVISION_RC=3
+  export STUB_PROVISION_RC
+  PUSH_RC=0
+  OUTPUT=$(push_run) || PUSH_RC=$?
+  check "failed provision is an error" 1 "$PUSH_RC"
+  check "failed provision points at the rollback" 1 "$(grep -c 'dashcam-bridge.previous' <<<"$OUTPUT")"
+  rm -rf "$STUB"
+
+  push_sandbox
+  STUB_SHARE_STATE=failed
+  export STUB_SHARE_STATE
+  PUSH_RC=0
+  OUTPUT=$(push_run) || PUSH_RC=$?
+  check "a service that did not come back is an error" 1 "$PUSH_RC"
+  rm -rf "$STUB"
+
+  push_sandbox
+  OUTPUT=$(push_run --dir '../etc')
+  check "unsafe folder is refused" 1 "$(grep -c 'simple folder name' <<<"$OUTPUT")"
+  OUTPUT=$(PATH=$STUB/bin:$PATH "$PUSH_BASH" "$PUSH" --host 'x;reboot' --skip-tests </dev/null 2>&1)
+  check "unsafe host is refused" 1 "$(grep -c 'must look like' <<<"$OUTPUT")"
+  OUTPUT=$(push_run --dry-run)
+  check "dry run lists files" 1 "$(grep -c '^scripts/provision.sh$' <<<"$OUTPUT")"
+  check "dry run leaves out the env file" 0 "$(grep -c '^config/dashcam-bridge.env$' <<<"$OUTPUT")"
+  check "dry run touches nothing" no "$([[ -e $STUB/home/dashcam-bridge ]] && echo yes || echo no)"
+  rm -rf "$STUB"
+fi
+
 # --- telemetry -------------------------------------------------------------
 
 if [[ -f $SCRIPTS/telemetry.py ]]; then
@@ -267,6 +560,16 @@ if [[ -f $SCRIPTS/telemetry.py ]]; then
   check "privileged port is refused" "yes" "$(telemetry_refused TELEMETRY_PORT TELEMETRY_PORT=80)"
   check "zero threshold is refused" "yes" "$(telemetry_refused BRAKE TELEMETRY_BRAKE_MPS2=0.0)"
   check "webhook needs http" "yes" "$(telemetry_refused WEBHOOK_URL TELEMETRY_WEBHOOK_URL=ftp://x)"
+  check "bad alert mode is refused" "yes" "$(telemetry_refused TELEMETRY_ALERT_SWERVE TELEMETRY_ALERT_SWERVE=loud)"
+  check "per-alert webhook needs http" "yes" "$(telemetry_refused SWERVE_WEBHOOK TELEMETRY_ALERT_SWERVE_WEBHOOK=ftp://x)"
+  check "per-alert format is checked" "yes" "$(telemetry_refused WEBHOOK_FORMAT TELEMETRY_ALERT_SWERVE_WEBHOOK_FORMAT=xml)"
+  check "alert modes pass" "" "$(telemetry_value TELEMETRY_ALERT_SWERVE=log TELEMETRY_ALERT_POTHOLE=alert TELEMETRY_ALERT_POTHOLE_WEBHOOK=https://x/y)"
+  check "bad setting is refused" "yes" "$(telemetry_refused IMPACT TELEMETRY_IMPACT_MPS2=lots)"
+  check "good zones pass" "" "$(telemetry_value 'TELEMETRY_GEOFENCE_ZONES=home:37.5,-122.1:150;work:37.4,-122.0:200' 'TELEMETRY_SPEEDING_ZONES=s:37.5,-122.1:300:25')"
+  check "bad zone is refused" "yes" "$(telemetry_refused GEOFENCE_ZONES TELEMETRY_GEOFENCE_ZONES=home:37.5:150)"
+  check "speeding zone needs a limit" "yes" "$(telemetry_refused SPEEDING_ZONES TELEMETRY_SPEEDING_ZONES=s:37.5,-122.1:300)"
+  check "quiet hours pass" "" "$(telemetry_value TELEMETRY_UNEXPECTED_HOURS=23-5)"
+  check "impossible hours are refused" "yes" "$(telemetry_refused UNEXPECTED_HOURS TELEMETRY_UNEXPECTED_HOURS=25-5)"
   check "write log needs telemetry" "yes" "$(telemetry_refused 'needs TELEMETRY' TELEMETRY=0 TELEMETRY_WRITE_LOG=1)"
 
   UNITS=$SCRIPTS/../systemd

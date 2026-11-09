@@ -58,6 +58,7 @@ User `dashcam`, password `SMB_PASSWORD` from the env file. The folders under `Te
 | `docs/hardware.md` | Which Pi, power, cable, storage, heat |
 | `docs/build.md` | OS image, boot config, packages, provision |
 | `docs/operations.md` | Connecting, copying, troubleshooting |
+| `tools/push-to-pi.sh` | Push an update from a Mac to the Pi |
 | `config/dashcam-bridge.env` | Passwords, image size, Wi-Fi |
 | `config/smb.conf` | The SMB share |
 | `config/boot/config.txt.fragment` | USB device-mode overlay |

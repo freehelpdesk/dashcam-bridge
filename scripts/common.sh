@@ -29,6 +29,30 @@ die() {
   exit 1
 }
 
+# Drive the glovebox carrier's USB mux. dh hands the car this gadget.
+# dl hands it back to the passthrough socket. An empty USB_TAKEOVER_GPIO,
+# or a Pi without pinctrl, leaves the pin alone.
+usb_takeover() {
+  local level=$1 gpio=${USB_TAKEOVER_GPIO-}
+  if [[ -z $gpio && -f $ENV_FILE ]]; then
+    gpio=$(grep -E '^USB_TAKEOVER_GPIO=' "$ENV_FILE" | tail -1 | cut -d= -f2- | tr -d "\"'\r" || true)
+  fi
+  [[ -n $gpio ]] || return 0
+  if ! command -v pinctrl >/dev/null 2>&1; then
+    warn "pinctrl is not installed; USB passthrough mux left unchanged"
+    return 0
+  fi
+  if pinctrl set "$gpio" op "$level"; then
+    if [[ $level == dh ]]; then
+      log "USB mux GPIO ${gpio} high, car sees this gadget"
+    else
+      log "USB mux GPIO ${gpio} low, car sees the passthrough socket"
+    fi
+  else
+    warn "could not drive GPIO ${gpio}; USB mux left unchanged"
+  fi
+}
+
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     die "run as root"
@@ -60,6 +84,7 @@ load_env() {
   : "${GADGET_NOFUA:=0}"
   : "${POWER_SOURCE:=bus}"
   : "${REDUCED_POWER:=0}"
+  : "${USB_TAKEOVER_GPIO:=}"
   : "${TELEMETRY:=0}"
   : "${TELEMETRY_TOKEN:=}"
   : "${TELEMETRY_PORT:=8088}"
@@ -103,6 +128,7 @@ validate_env() {
   [[ $GADGET_NOFUA == "0" || $GADGET_NOFUA == "1" ]] || die "GADGET_NOFUA must be 0 or 1"
   [[ $POWER_SOURCE == "bus" || $POWER_SOURCE == "external" ]] || die "POWER_SOURCE must be bus or external"
   [[ $REDUCED_POWER == "0" || $REDUCED_POWER == "1" ]] || die "REDUCED_POWER must be 0 or 1"
+  [[ -z ${USB_TAKEOVER_GPIO:-} || ${USB_TAKEOVER_GPIO} =~ ^([0-9]|1[0-9]|2[0-7])$ ]] || die "USB_TAKEOVER_GPIO must be empty or a GPIO number 0-27"
   [[ $SNAP_CHUNK =~ ^[1-9][0-9]*$ ]] && ! ((SNAP_CHUNK & (SNAP_CHUNK - 1))) || die "SNAP_CHUNK must be a power of two"
   [[ $INBOX_GB =~ ^[0-9]+$ ]] || die "INBOX_GB must be a number (0 turns the inbox off)"
   [[ $INBOX_IDLE_SECS =~ ^[0-9]+$ && $INBOX_SETTLE_SECS =~ ^[0-9]+$ && $INBOX_MAX_SECS =~ ^[1-9][0-9]*$ ]] || die "INBOX_IDLE_SECS, INBOX_SETTLE_SECS, and INBOX_MAX_SECS must be numbers of seconds"

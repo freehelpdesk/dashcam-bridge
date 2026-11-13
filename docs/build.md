@@ -89,6 +89,7 @@ Set these before you run it. Provision refuses the `CHANGEME` placeholders.
 | `IMAGE_FS` | `ext4` (default) or `exfat` |
 | `GADGET_NOFUA` | `0` flushes writes. `1` is faster and can drop the tail of a clip when power dies |
 | `POWER_SOURCE` | `bus` for the one-cable Pi 4. `external` when a GPIO supply powers the board |
+| `USB_TAKEOVER_GPIO` | Empty on a stock Pi. `17` on the CM5 glovebox carrier, which passes a USB-A socket through to the car until the gadget binds |
 | `REDUCED_POWER` | `1` lowers a Pi 5's peak current by capping the CPU at 1.5 GHz, running PCIe at Gen 1, and holding an NVMe drive to its lowest-power working state. Default `0` |
 
 | `TELEMETRY`, `TELEMETRY_TOKEN`, `TELEMETRY_PORT` | `1` reads the car's data from finished clips and serves it on the port, default 8088. The token is required, 16 or more characters. Default `0`. The other `TELEMETRY_*` keys are described in `config/dashcam-bridge.env` and `docs/operations.md` |

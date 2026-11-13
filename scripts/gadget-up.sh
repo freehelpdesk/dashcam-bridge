@@ -16,6 +16,7 @@ findmnt -n --mountpoint /sys/kernel/config >/dev/null || mount -t configfs confi
 # Read the value. configfs reports every attribute as 4096 bytes, so -s is
 # true even for a gadget that never bound.
 if [[ -d $GADGET_ROOT && -n $(cat "$GADGET_ROOT/UDC" 2>/dev/null) ]]; then
+  usb_takeover dh
   exit 0
 fi
 
@@ -62,4 +63,5 @@ echo "$GADGET_NOFUA" >"$G/functions/mass_storage.0/lun.0/nofua"
 echo /dev/mapper/dashcam-origin >"$G/functions/mass_storage.0/lun.0/file"
 ln -s "$G/functions/mass_storage.0" "$G/configs/c.1/"
 echo "$udc" >"$G/UDC"
+usb_takeover dh
 log "gadget bound to $udc, $(cut -d' ' -f1 /proc/uptime)s after the kernel started"

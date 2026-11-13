@@ -45,6 +45,8 @@ Every current Raspberry Pi speaks USB 2.0 on the port that can act as a device.
 | Pi 3 Model B and older | None. The USB-A ports are hosts | — | — | Cannot face the car as a drive |
 | Compute Module 4 / 5 | Depends on the carrier | USB 2 on the official CM4 IO board | Depends on the carrier | A carrier-board project, not the first build |
 
+The CM5 glovebox carrier in the KiCAD project plugs its USB-A male straight into the car. A second USB-A socket is wired through to that plug until `USB_TAKEOVER_GPIO` (17 on that board) goes high. `gadget-up.sh` drives it high only after the gadget is bound, and `gadget-down.sh` drives it low first, so the car sees a stick in the spare socket whenever this gadget is down. Leave the setting empty on a Pi 4 or Pi 5. The carrier is powered from the car's USB port through one 1.5 A path, shared with a stick in the spare socket.
+
 Tesla asks for a drive with a sustained write of at least 4 MB/s. USB 2 clears that. Newer cars (HW4) can still show "USB drive too slow", because their bar sits above 4 MB/s and a Pi gadget is USB 2. That warning is about the link into the car. The files on the share are the bytes the car wrote.
 
 The car link stays USB 2 on a Pi 4 and a Pi 5. The blue USB-A ports are host ports. USB 3 device mode needs a different board (boards such as the Rock 4C+ show up in other projects for that reason). This project targets a Raspberry Pi.

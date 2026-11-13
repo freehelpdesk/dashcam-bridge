@@ -29,6 +29,8 @@ Buy a **Raspberry Pi 5, 4 GB**, when the Pi will have its own 5 V / 5 A supply a
 
 The Pi Zero 2 W fits a glovebox and is a poor fit for this job: its Wi-Fi is 2.4 GHz only. A full comparison, the cable, the power wiring, and the card to buy are in [docs/hardware.md](docs/hardware.md).
 
+On the CM5 glovebox carrier, set `USB_TAKEOVER_GPIO=17`. The car keeps a spare USB-A socket until the gadget binds, then the same port switches over to this Pi. Leave that setting empty on a Pi 4 or Pi 5.
+
 ## Build
 
 Flash **Raspberry Pi OS Lite (64-bit)** and run `scripts/provision.sh` on the Pi. The script installs Samba, the USB gadget, and the snapshot share. There is no custom kernel. Details, the boot config, and a bench test are in [docs/build.md](docs/build.md).
